@@ -5,6 +5,7 @@ from PySide6.QtGui import QColor, QFontMetrics, QKeyEvent, QMouseEvent, QPainter
 from PySide6.QtWidgets import QPlainTextEdit, QTextEdit, QWidget
 
 from temcode.editor.highlighting import LANGUAGE_DISPLAY_NAMES, LanguageId, build_highlighter
+from temcode.ui.style import DEFAULT_THEME_ID, normalize_theme_id
 
 
 class LineNumberArea(QWidget):
@@ -60,6 +61,18 @@ class CodeEditor(QPlainTextEdit):
     _CLOSING_TO_OPENING = {")": "(", "]": "[", "}": "{"}
     _MIN_ZOOM_POINT_SIZE = 8.0
     _MAX_ZOOM_POINT_SIZE = 40.0
+    _DEFAULT_THEME_COLORS = {
+        "line_number_bg": "#252526",
+        "line_number_active_fg": "#c8c8c8",
+        "line_number_fg": "#6e7681",
+        "current_line_bg": "#2a2d2e",
+    }
+    _SLATE_LIGHT_THEME_COLORS = {
+        "line_number_bg": "#f3f6fa",
+        "line_number_active_fg": "#0f172a",
+        "line_number_fg": "#64748b",
+        "current_line_bg": "#ffffff",
+    }
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -74,6 +87,7 @@ class CodeEditor(QPlainTextEdit):
         self._language_id = LanguageId.PLAIN_TEXT
         self._language_display_name = LANGUAGE_DISPLAY_NAMES[LanguageId.PLAIN_TEXT]
         self._large_file_mode = False
+        self._theme_id = DEFAULT_THEME_ID
 
         self._line_number_area = LineNumberArea(self)
         self._minimap_area = MinimapArea(self)
@@ -119,6 +133,14 @@ class CodeEditor(QPlainTextEdit):
     def is_large_file_mode(self) -> bool:
         return self._large_file_mode
 
+    def set_theme(self, theme_id: str | None) -> None:
+        normalized_theme = normalize_theme_id(theme_id)
+        if normalized_theme == self._theme_id:
+            return
+        self._theme_id = normalized_theme
+        self._refresh_internal_highlights()
+        self._line_number_area.update()
+
     def line_number_area_width(self) -> int:
         digits = len(str(max(1, self.blockCount())))
         return 8 + self.fontMetrics().horizontalAdvance("9") * digits
@@ -127,8 +149,9 @@ class CodeEditor(QPlainTextEdit):
         return self._minimap_width
 
     def line_number_area_paint_event(self, event) -> None:
+        colors = self._active_theme_colors()
         painter = QPainter(self._line_number_area)
-        painter.fillRect(event.rect(), QColor("#252526"))
+        painter.fillRect(event.rect(), QColor(colors["line_number_bg"]))
 
         block = self.firstVisibleBlock()
         block_number = block.blockNumber()
@@ -138,7 +161,10 @@ class CodeEditor(QPlainTextEdit):
 
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
-                painter.setPen(QColor("#c8c8c8") if block_number == current_block else QColor("#6e7681"))
+                painter.setPen(
+                    QColor(colors["line_number_active_fg"]) if block_number == current_block
+                    else QColor(colors["line_number_fg"])
+                )
                 painter.drawText(
                     0,
                     top,
@@ -336,12 +362,18 @@ class CodeEditor(QPlainTextEdit):
         super().setExtraSelections(self._internal_extra_selections + self._external_extra_selections)
 
     def _add_current_line_highlight(self) -> None:
+        colors = self._active_theme_colors()
         selection = QTextEdit.ExtraSelection()
-        selection.format.setBackground(QColor("#2a2d2e"))
+        selection.format.setBackground(QColor(colors["current_line_bg"]))
         selection.format.setProperty(QTextFormat.FullWidthSelection, True)
         selection.cursor = self.textCursor()
         selection.cursor.clearSelection()
         self._internal_extra_selections.append(selection)
+
+    def _active_theme_colors(self) -> dict[str, str]:
+        if self._theme_id == "light":
+            return self._SLATE_LIGHT_THEME_COLORS
+        return self._DEFAULT_THEME_COLORS
 
     def _add_bracket_highlights(self) -> None:
         cursor_pos = self.textCursor().position()

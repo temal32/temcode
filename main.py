@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sys
 
+version = 1.1
+
 from temcode.app import run
 
 

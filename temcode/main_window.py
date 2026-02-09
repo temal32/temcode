@@ -5,15 +5,22 @@ import os
 import shutil
 import hashlib
 import time
+import webbrowser
 from datetime import datetime
 
 from PySide6.QtCore import QDir, QFileSystemWatcher, QModelIndex, QPoint, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QFileDialog,
     QFileSystemModel,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QInputDialog,
@@ -27,16 +34,27 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSplitter,
+    QSpinBox,
     QStackedWidget,
+    QTabBar,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QTreeView,
     QVBoxLayout,
     QWidget,
 )
 
+from temcode import __version__
 from temcode.editor import CodeEditor
 from temcode.terminal import CmdTerminalWidget
+from temcode.ui.style import (
+    DEFAULT_THEME_ID,
+    available_theme_ids,
+    normalize_theme_id,
+    theme_display_name,
+    theme_stylesheet_for,
+)
 
 
 class MainWindow(QMainWindow):
@@ -55,8 +73,16 @@ class MainWindow(QMainWindow):
     _MAX_RECENT_PATHS = 20
     _BOTTOM_LAYOUT_STACKED = "stacked"
     _BOTTOM_LAYOUT_SIDE_BY_SIDE = "side_by_side"
+    _DEFAULT_THEME_ID = DEFAULT_THEME_ID
+    _DEFAULT_UI_ZOOM_PERCENT = 100
+    _MIN_UI_ZOOM_PERCENT = 70
+    _MAX_UI_ZOOM_PERCENT = 200
+    _UI_ZOOM_STEP_PERCENT = 10
+    _TAB_CLOSE_BUTTON_BASE_WIDTH = 24
+    _TAB_CLOSE_BUTTON_BASE_HEIGHT = 20
     _MIN_WINDOW_WIDTH = 640
     _MIN_WINDOW_HEIGHT = 420
+    _GITHUB_REPO_URL = "https://github.com/temal32/temcode"
 
     def __init__(self) -> None:
         super().__init__()
@@ -68,6 +94,8 @@ class MainWindow(QMainWindow):
         self._autosave_enabled = self._DEFAULT_AUTOSAVE_ENABLED
         self._autosave_interval_seconds = self._DEFAULT_AUTOSAVE_INTERVAL_SECONDS
         self._autosave_last_summary = ""
+        self._theme_id = self._DEFAULT_THEME_ID
+        self._ui_zoom_percent = self._DEFAULT_UI_ZOOM_PERCENT
         self._settings_file_path: str | None = None
         self._recent_paths_file_path: str | None = None
         self._recent_paths: list[str] = []
@@ -173,8 +201,14 @@ class MainWindow(QMainWindow):
 
         edit_menu.addAction(self.find_action)
         edit_menu.addAction(self.replace_action)
+        edit_menu.addSeparator()
 
-        self.solution_explorer_toggle_action = QAction("Solution Explorer", self)
+        self.settings_action = QAction("&Settings...", self)
+        self.settings_action.setShortcut(QKeySequence("Ctrl+,"))
+        self.settings_action.triggered.connect(self.open_settings_dialog)
+        edit_menu.addAction(self.settings_action)
+
+        self.solution_explorer_toggle_action = QAction("Explorer", self)
         self.output_toggle_action = QAction("Output", self)
         self.terminal_toggle_action = QAction("Terminal", self)
         self.split_toggle_action = QAction("Split Editor", self)
@@ -203,6 +237,18 @@ class MainWindow(QMainWindow):
         self.move_tab_to_other_split_action.setShortcut(QKeySequence("Ctrl+Shift+M"))
         self.move_tab_to_other_split_action.triggered.connect(self.move_current_tab_to_other_split)
 
+        self.zoom_in_ui_action = QAction("Zoom In", self)
+        self.zoom_in_ui_action.setShortcut(QKeySequence("Ctrl+="))
+        self.zoom_in_ui_action.triggered.connect(lambda: self._adjust_ui_zoom(1))
+
+        self.zoom_out_ui_action = QAction("Zoom Out", self)
+        self.zoom_out_ui_action.setShortcut(QKeySequence("Ctrl+-"))
+        self.zoom_out_ui_action.triggered.connect(lambda: self._adjust_ui_zoom(-1))
+
+        self.zoom_reset_ui_action = QAction("Reset Zoom", self)
+        self.zoom_reset_ui_action.setShortcut(QKeySequence("Ctrl+0"))
+        self.zoom_reset_ui_action.triggered.connect(self._reset_ui_zoom)
+
         view_menu.addAction(self.solution_explorer_toggle_action)
         view_menu.addAction(self.output_toggle_action)
         view_menu.addAction(self.terminal_toggle_action)
@@ -213,9 +259,20 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         view_menu.addAction(self.split_toggle_action)
         view_menu.addAction(self.move_tab_to_other_split_action)
+        view_menu.addSeparator()
+        zoom_menu = view_menu.addMenu("Interface Zoom")
+        zoom_menu.addAction(self.zoom_in_ui_action)
+        zoom_menu.addAction(self.zoom_out_ui_action)
+        zoom_menu.addAction(self.zoom_reset_ui_action)
+        self._update_ui_zoom_actions()
+
+        github_action = QAction("&GitHub Repository", self)
+        github_action.triggered.connect(self._open_github_repo)
+        help_menu.addAction(github_action)
+        help_menu.addSeparator()
 
         about_action = QAction("&About Temcode", self)
-        about_action.triggered.connect(lambda: self.statusBar().showMessage("Temcode v0.2", 2500))
+        about_action.triggered.connect(lambda: self.statusBar().showMessage(f"Temcode Version {__version__}", 2500))
         help_menu.addAction(about_action)
 
     def _build_status_bar(self) -> None:
@@ -230,6 +287,11 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.autosave_status_label)
         self.statusBar().addPermanentWidget(self.language_status_label)
         self.statusBar().addPermanentWidget(self.large_file_status_label)
+
+    def _open_github_repo(self) -> None:
+        opened = webbrowser.open(self._GITHUB_REPO_URL, new=2, autoraise=True)
+        if not opened:
+            self.statusBar().showMessage("Could not open GitHub repository.", 2500)
 
     def _build_central_editor_area(self) -> None:
         self.central_editor_widget = QWidget(self)
@@ -335,7 +397,7 @@ class MainWindow(QMainWindow):
         title_label.setObjectName("welcomeTitle")
 
         subtitle_label = QLabel(
-            "Open a file or folder, or continue from a recent path.",
+            "Open or create a file/folder, or continue from a recent path.",
             panel,
         )
         subtitle_label.setObjectName("welcomeSubtitle")
@@ -344,6 +406,14 @@ class MainWindow(QMainWindow):
         action_row_layout = QHBoxLayout(action_row)
         action_row_layout.setContentsMargins(0, 0, 0, 0)
         action_row_layout.setSpacing(8)
+
+        new_file_button = QPushButton("New File...", action_row)
+        new_file_button.setObjectName("welcomeActionButton")
+        new_file_button.clicked.connect(self._create_file_from_welcome)
+
+        new_folder_button = QPushButton("New Folder...", action_row)
+        new_folder_button.setObjectName("welcomeActionButton")
+        new_folder_button.clicked.connect(self._create_folder_from_welcome)
 
         open_file_button = QPushButton("Open File...", action_row)
         open_file_button.setObjectName("welcomeActionButton")
@@ -357,6 +427,8 @@ class MainWindow(QMainWindow):
         open_recent_button.setObjectName("welcomeActionButton")
         open_recent_button.clicked.connect(self._open_selected_recent_path)
 
+        action_row_layout.addWidget(new_file_button, 0)
+        action_row_layout.addWidget(new_folder_button, 0)
         action_row_layout.addWidget(open_file_button, 0)
         action_row_layout.addWidget(open_folder_button, 0)
         action_row_layout.addWidget(open_recent_button, 0)
@@ -522,8 +594,7 @@ class MainWindow(QMainWindow):
         tabs.setObjectName(object_name)
         tabs.setDocumentMode(True)
         tabs.setMovable(True)
-        tabs.setTabsClosable(True)
-        tabs.tabCloseRequested.connect(lambda i, t=tabs: self._request_close_tab(t, i))
+        tabs.setTabsClosable(False)
         tabs.currentChanged.connect(lambda i, t=tabs: self._on_current_tab_changed(t, i))
         tabs.tabBarClicked.connect(lambda _i, t=tabs: self._set_active_tab_widget(t))
         tabs.tabBar().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -532,8 +603,58 @@ class MainWindow(QMainWindow):
         )
         return tabs
 
+    def _add_editor_tab(self, tabs: QTabWidget, editor: CodeEditor, title: str) -> int:
+        tab_index = tabs.addTab(editor, title)
+        self._set_editor_tab_close_button(tabs, tab_index, editor)
+        return tab_index
+
+    def _set_editor_tab_close_button(self, tabs: QTabWidget, tab_index: int, editor: CodeEditor) -> None:
+        close_button = QToolButton(tabs.tabBar())
+        close_button.setObjectName("editorTabCloseButton")
+        close_button.setText("X")
+        close_button.setToolTip("Close")
+        close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_button.setAutoRaise(True)
+        close_button.setFixedSize(
+            self._scaled_pixels(self._TAB_CLOSE_BUTTON_BASE_WIDTH),
+            self._scaled_pixels(self._TAB_CLOSE_BUTTON_BASE_HEIGHT),
+        )
+        close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        close_button.clicked.connect(
+            lambda _checked=False, t=tabs, e=editor: self._close_editor_from_tab_button(t, e)
+        )
+        tabs.tabBar().setTabButton(tab_index, QTabBar.ButtonPosition.RightSide, close_button)
+
+    def _close_editor_from_tab_button(self, tabs: QTabWidget, editor: CodeEditor) -> None:
+        tab_index = tabs.indexOf(editor)
+        if tab_index >= 0:
+            self._request_close_tab(tabs, tab_index)
+            return
+
+        owner_tabs = self._find_tab_widget_for_editor(editor)
+        if owner_tabs is None:
+            return
+
+        owner_index = owner_tabs.indexOf(editor)
+        if owner_index >= 0:
+            self._request_close_tab(owner_tabs, owner_index)
+
+    def _scaled_pixels(self, base_px: int) -> int:
+        scaled = int(round(base_px * (self._ui_zoom_percent / 100.0)))
+        return max(1, scaled)
+
+    def _refresh_tab_close_button_sizes(self) -> None:
+        width = self._scaled_pixels(self._TAB_CLOSE_BUTTON_BASE_WIDTH)
+        height = self._scaled_pixels(self._TAB_CLOSE_BUTTON_BASE_HEIGHT)
+        for tabs in self._all_tab_widgets():
+            tab_bar = tabs.tabBar()
+            for tab_index in range(tabs.count()):
+                button = tab_bar.tabButton(tab_index, QTabBar.ButtonPosition.RightSide)
+                if isinstance(button, QToolButton):
+                    button.setFixedSize(width, height)
+
     def _build_solution_explorer_dock(self) -> None:
-        self.solution_explorer_dock = QDockWidget("Solution Explorer", self)
+        self.solution_explorer_dock = QDockWidget("Explorer", self)
         self.solution_explorer_dock.setObjectName("solutionExplorerDock")
         self.solution_explorer_dock.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
@@ -683,6 +804,34 @@ class MainWindow(QMainWindow):
         if folder:
             self.set_workspace_root(folder)
 
+    def _create_file_from_welcome(self) -> None:
+        start_dir = self.workspace_root or os.getcwd()
+        parent_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Choose Folder for New File",
+            start_dir,
+        )
+        if not parent_dir:
+            return
+
+        created_path = self._create_new_file(parent_dir)
+        if created_path:
+            self.open_file(created_path)
+
+    def _create_folder_from_welcome(self) -> None:
+        start_dir = self.workspace_root or os.getcwd()
+        parent_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Choose Parent Folder",
+            start_dir,
+        )
+        if not parent_dir:
+            return
+
+        created_path = self._create_new_folder(parent_dir)
+        if created_path:
+            self.set_workspace_root(created_path)
+
     def close_workspace(self) -> None:
         if not self._close_all_open_editors():
             return
@@ -693,7 +842,7 @@ class MainWindow(QMainWindow):
 
         root_index = self.fs_model.setRootPath("")
         self.file_tree.setRootIndex(root_index)
-        self.solution_explorer_dock.setWindowTitle("Solution Explorer")
+        self.solution_explorer_dock.setWindowTitle("Explorer")
         self.setWindowTitle("Temcode")
 
         if self.terminal_console is not None:
@@ -717,7 +866,7 @@ class MainWindow(QMainWindow):
         self.file_tree.setRootIndex(index)
         self.workspace_root = normalized
         workspace_name = os.path.basename(normalized.rstrip("\\/")) or normalized
-        self.solution_explorer_dock.setWindowTitle(f"Solution Explorer - {workspace_name}")
+        self.solution_explorer_dock.setWindowTitle(f"Explorer - {workspace_name}")
         self.setWindowTitle(f"Temcode - {normalized}")
         self.statusBar().showMessage(f"Workspace: {normalized}", 3000)
         self.log(f"[workspace] Opened folder: {normalized}")
@@ -796,7 +945,7 @@ class MainWindow(QMainWindow):
             large_file_reason="",
         )
         target_tabs = self._active_editor_tabs or self.primary_tabs
-        tab_index = target_tabs.addTab(editor, display_name)
+        tab_index = self._add_editor_tab(target_tabs, editor, display_name)
         target_tabs.setTabToolTip(tab_index, display_name)
         target_tabs.setCurrentIndex(tab_index)
         self._set_active_tab_widget(target_tabs)
@@ -806,48 +955,52 @@ class MainWindow(QMainWindow):
         self._refresh_breadcrumbs(editor)
         self.log(f"[editor] New file: {display_name}")
 
-    def _create_new_file(self, parent_dir: str) -> None:
+    def _create_new_file(self, parent_dir: str) -> str | None:
         file_name, ok = QInputDialog.getText(self, "New File", "File name:")
         if not ok:
-            return
+            return None
 
         file_name = file_name.strip()
         if not file_name:
-            return
+            return None
 
         full_path = os.path.join(parent_dir, file_name)
         if os.path.exists(full_path):
             QMessageBox.warning(self, "Create File", f"A file or folder already exists:\n{full_path}")
-            return
+            return None
 
         try:
             with open(full_path, "x", encoding="utf-8"):
                 pass
             self.log(f"[file] Created file: {full_path}")
             self._reveal_path(full_path)
+            return full_path
         except OSError as exc:
             self._show_error("Create File", full_path, exc)
+            return None
 
-    def _create_new_folder(self, parent_dir: str) -> None:
+    def _create_new_folder(self, parent_dir: str) -> str | None:
         folder_name, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
         if not ok:
-            return
+            return None
 
         folder_name = folder_name.strip()
         if not folder_name:
-            return
+            return None
 
         full_path = os.path.join(parent_dir, folder_name)
         if os.path.exists(full_path):
             QMessageBox.warning(self, "Create Folder", f"A file or folder already exists:\n{full_path}")
-            return
+            return None
 
         try:
             os.mkdir(full_path)
             self.log(f"[file] Created folder: {full_path}")
             self._reveal_path(full_path)
+            return full_path
         except OSError as exc:
             self._show_error("Create Folder", full_path, exc)
+            return None
 
     def _rename_path(self, old_path: str) -> None:
         if self.workspace_root and self._paths_equal(old_path, self.workspace_root):
@@ -946,7 +1099,7 @@ class MainWindow(QMainWindow):
         )
 
         target_tabs = self._active_editor_tabs or self.primary_tabs
-        tab_index = target_tabs.addTab(editor, "")
+        tab_index = self._add_editor_tab(target_tabs, editor, "")
         target_tabs.setCurrentIndex(tab_index)
         self._set_active_tab_widget(target_tabs)
 
@@ -1214,6 +1367,7 @@ class MainWindow(QMainWindow):
         large_file_reason: str,
     ) -> CodeEditor:
         editor = CodeEditor(self)
+        editor.set_theme(self._theme_id)
         editor.setPlainText(content)
         editor.document().setModified(False)
         editor.setProperty("file_path", os.path.abspath(file_path) if file_path else None)
@@ -1265,6 +1419,113 @@ class MainWindow(QMainWindow):
             self.large_file_status_label.setText("")
             self.large_file_status_label.setToolTip("")
 
+    def open_settings_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Settings")
+        dialog.setModal(True)
+
+        layout = QVBoxLayout(dialog)
+        form_layout = QFormLayout()
+        form_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        theme_combobox = QComboBox(dialog)
+        for theme_id in available_theme_ids():
+            theme_combobox.addItem(theme_display_name(theme_id), theme_id)
+        current_theme_index = theme_combobox.findData(self._theme_id)
+        if current_theme_index >= 0:
+            theme_combobox.setCurrentIndex(current_theme_index)
+
+        autosave_enabled_checkbox = QCheckBox("Enable autosave backups", dialog)
+        autosave_enabled_checkbox.setChecked(self._autosave_enabled)
+
+        autosave_interval_spinbox = QSpinBox(dialog)
+        autosave_interval_spinbox.setRange(
+            self._MIN_AUTOSAVE_INTERVAL_SECONDS,
+            self._MAX_AUTOSAVE_INTERVAL_SECONDS,
+        )
+        autosave_interval_spinbox.setValue(self._autosave_interval_seconds)
+        autosave_interval_spinbox.setSuffix(" s")
+        autosave_interval_spinbox.setEnabled(self._autosave_enabled)
+        autosave_enabled_checkbox.toggled.connect(autosave_interval_spinbox.setEnabled)
+
+        form_layout.addRow("Theme", theme_combobox)
+        form_layout.addRow("Autosave", autosave_enabled_checkbox)
+        form_layout.addRow("Interval", autosave_interval_spinbox)
+        layout.addLayout(form_layout)
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            dialog,
+        )
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        if dialog.exec() != int(QDialog.DialogCode.Accepted):
+            return
+
+        selected_theme_data = theme_combobox.currentData()
+        selected_theme_id = normalize_theme_id(selected_theme_data if isinstance(selected_theme_data, str) else None)
+        self._apply_theme(selected_theme_id)
+
+        self._autosave_enabled = autosave_enabled_checkbox.isChecked()
+        self._autosave_interval_seconds = max(
+            self._MIN_AUTOSAVE_INTERVAL_SECONDS,
+            min(self._MAX_AUTOSAVE_INTERVAL_SECONDS, int(autosave_interval_spinbox.value())),
+        )
+        self._autosave_last_summary = ""
+        self._configure_autosave_timer()
+
+        if self._persist_settings_preferences():
+            self.statusBar().showMessage("Settings saved.", 2200)
+            self.log(
+                f"[settings] Preferences updated: theme={self._theme_id}, "
+                f"autosave_enabled={self._autosave_enabled}, "
+                f"autosave_interval={self._autosave_interval_seconds}s"
+            )
+        else:
+            self.statusBar().showMessage("Applied settings, but failed to write settings file.", 3200)
+
+    def _adjust_ui_zoom(self, step_direction: int) -> None:
+        if step_direction == 0:
+            return
+        target_zoom = self._ui_zoom_percent + (step_direction * self._UI_ZOOM_STEP_PERCENT)
+        self._set_ui_zoom_percent(target_zoom)
+
+    def _reset_ui_zoom(self) -> None:
+        self._set_ui_zoom_percent(self._DEFAULT_UI_ZOOM_PERCENT)
+
+    def _set_ui_zoom_percent(self, zoom_percent: int, persist: bool = True) -> None:
+        clamped_zoom = max(self._MIN_UI_ZOOM_PERCENT, min(self._MAX_UI_ZOOM_PERCENT, int(zoom_percent)))
+        if clamped_zoom == self._ui_zoom_percent:
+            self._update_ui_zoom_actions()
+            self.statusBar().showMessage(f"UI Zoom: {self._ui_zoom_percent}%", 1800)
+            return
+
+        self._ui_zoom_percent = clamped_zoom
+        self._apply_theme(self._theme_id)
+        self._update_ui_zoom_actions()
+        self.statusBar().showMessage(f"UI Zoom: {self._ui_zoom_percent}%", 1800)
+
+        if persist and not self._suspend_ui_settings_persistence and not self._is_app_closing:
+            self._persist_ui_settings()
+
+    def _update_ui_zoom_actions(self) -> None:
+        if not hasattr(self, "zoom_in_ui_action") or not hasattr(self, "zoom_out_ui_action"):
+            return
+        self.zoom_in_ui_action.setEnabled(self._ui_zoom_percent < self._MAX_UI_ZOOM_PERCENT)
+        self.zoom_out_ui_action.setEnabled(self._ui_zoom_percent > self._MIN_UI_ZOOM_PERCENT)
+
+    def _apply_theme(self, theme_id: str | None) -> None:
+        normalized_theme = normalize_theme_id(theme_id)
+        self._theme_id = normalized_theme
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(theme_stylesheet_for(normalized_theme, self._ui_zoom_percent))
+        for editor in self._open_editors():
+            editor.set_theme(normalized_theme)
+        self._refresh_tab_close_button_sizes()
+
     def _workspace_settings_dir(self) -> str:
         source_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
         return os.path.join(source_root, self._SETTINGS_DIR_NAME)
@@ -1280,6 +1541,8 @@ class MainWindow(QMainWindow):
                 "strategy": "backup",
             },
             "ui": {
+                "theme": self._DEFAULT_THEME_ID,
+                "zoom_percent": self._DEFAULT_UI_ZOOM_PERCENT,
                 "bottom_panel_layout": self._BOTTOM_LAYOUT_STACKED,
                 "output_enabled": True,
                 "terminal_enabled": True,
@@ -1344,6 +1607,44 @@ class MainWindow(QMainWindow):
         if layout_value is not None:
             self.log("[settings] Invalid ui.bottom_panel_layout; keeping current layout.")
         return self._bottom_layout_mode
+
+    def _parse_theme_setting(self, payload: object) -> str:
+        if not isinstance(payload, dict):
+            return self._DEFAULT_THEME_ID
+
+        ui_payload = payload.get("ui")
+        if not isinstance(ui_payload, dict):
+            return self._DEFAULT_THEME_ID
+
+        theme_value = ui_payload.get("theme")
+        if isinstance(theme_value, str):
+            return normalize_theme_id(theme_value)
+        if theme_value is not None:
+            self.log("[settings] Invalid ui.theme; using default theme.")
+        return self._DEFAULT_THEME_ID
+
+    def _parse_ui_zoom_setting(self, payload: object) -> int:
+        if not isinstance(payload, dict):
+            return self._DEFAULT_UI_ZOOM_PERCENT
+
+        ui_payload = payload.get("ui")
+        if not isinstance(ui_payload, dict):
+            return self._DEFAULT_UI_ZOOM_PERCENT
+
+        zoom_value = ui_payload.get("zoom_percent")
+        if zoom_value is None:
+            return self._DEFAULT_UI_ZOOM_PERCENT
+
+        try:
+            parsed_zoom = int(zoom_value)
+        except (TypeError, ValueError):
+            self.log("[settings] Invalid ui.zoom_percent; using default zoom.")
+            return self._DEFAULT_UI_ZOOM_PERCENT
+
+        clamped_zoom = max(self._MIN_UI_ZOOM_PERCENT, min(self._MAX_UI_ZOOM_PERCENT, parsed_zoom))
+        if clamped_zoom != parsed_zoom:
+            self.log("[settings] ui.zoom_percent out of bounds; clamped to supported range.")
+        return clamped_zoom
 
     def _parse_bottom_panel_visibility_settings(self, payload: object) -> tuple[bool, bool]:
         output_enabled = self.output_dock.isVisible() if hasattr(self, "output_dock") else True
@@ -1423,6 +1724,50 @@ class MainWindow(QMainWindow):
         finally:
             self._suspend_ui_settings_persistence = False
 
+    def _persist_settings_preferences(self) -> bool:
+        settings_path = self._workspace_settings_path()
+        payload: dict[str, object] = self._default_settings_payload()
+
+        try:
+            self._ensure_workspace_settings_file(settings_path)
+            with open(settings_path, "r", encoding="utf-8") as handle:
+                parsed_payload = json.load(handle)
+            if isinstance(parsed_payload, dict):
+                payload = parsed_payload
+            else:
+                self.log("[settings] Root JSON must be an object; rewriting settings with defaults.")
+        except OSError as exc:
+            self.log(f"[settings] Could not read {settings_path} for settings persistence: {exc}")
+            return False
+        except json.JSONDecodeError as exc:
+            self.log(f"[settings] Invalid JSON in {settings_path}; rewriting settings sections: {exc}")
+
+        autosave_payload = payload.get("autosave")
+        if not isinstance(autosave_payload, dict):
+            autosave_payload = {}
+        autosave_payload["enabled"] = self._autosave_enabled
+        autosave_payload["interval_seconds"] = self._autosave_interval_seconds
+        autosave_payload.setdefault("strategy", "backup")
+        payload["autosave"] = autosave_payload
+
+        ui_payload = payload.get("ui")
+        if not isinstance(ui_payload, dict):
+            ui_payload = {}
+        ui_payload["theme"] = self._theme_id
+        ui_payload["zoom_percent"] = self._ui_zoom_percent
+        payload["ui"] = ui_payload
+
+        try:
+            with open(settings_path, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(payload, handle, indent=2)
+                handle.write("\n")
+        except OSError as exc:
+            self.log(f"[settings] Could not write {settings_path}: {exc}")
+            return False
+
+        self._settings_file_path = settings_path
+        return True
+
     def _persist_ui_settings(self) -> None:
         settings_path = self._settings_file_path or self._workspace_settings_path()
         payload: dict[str, object] = self._default_settings_payload()
@@ -1444,6 +1789,8 @@ class MainWindow(QMainWindow):
         ui_payload = payload.get("ui")
         if not isinstance(ui_payload, dict):
             ui_payload = {}
+        ui_payload["theme"] = self._theme_id
+        ui_payload["zoom_percent"] = self._ui_zoom_percent
         ui_payload["bottom_panel_layout"] = self._bottom_layout_mode
         ui_payload["output_enabled"] = self.output_dock.isVisible()
         ui_payload["terminal_enabled"] = self.terminal_dock.isVisible()
@@ -1486,6 +1833,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Settings JSON is invalid; autosave defaults applied.", 3500)
 
         self._autosave_enabled, self._autosave_interval_seconds = self._parse_autosave_settings(payload)
+        self._ui_zoom_percent = self._parse_ui_zoom_setting(payload)
+        self._apply_theme(self._parse_theme_setting(payload))
+        self._update_ui_zoom_actions()
         if not self._startup_window_mode_loaded:
             saved_window_size = self._parse_window_size_setting(payload)
             if saved_window_size is None:
@@ -1976,7 +2326,7 @@ class MainWindow(QMainWindow):
             tooltip = self.secondary_tabs.tabToolTip(0)
             self.secondary_tabs.removeTab(0)
 
-            new_index = self.primary_tabs.addTab(editor, title)
+            new_index = self._add_editor_tab(self.primary_tabs, editor, title)
             self.primary_tabs.setTabToolTip(new_index, tooltip)
 
         self.secondary_tabs.hide()
@@ -2002,7 +2352,7 @@ class MainWindow(QMainWindow):
         tooltip = current_tabs.tabToolTip(tab_index)
         current_tabs.removeTab(tab_index)
 
-        new_index = target_tabs.addTab(editor, title)
+        new_index = self._add_editor_tab(target_tabs, editor, title)
         target_tabs.setTabToolTip(new_index, tooltip)
         target_tabs.setCurrentIndex(new_index)
         self._set_active_tab_widget(target_tabs)
