@@ -515,6 +515,32 @@ QFrame#breadcrumbsBar {{
     border-bottom: 1px solid {colors["breadcrumbs_border_bottom"]};
 }}
 
+QFrame#solutionNavBar {{
+    background: {colors["dock_title_bg"]};
+    border-right: 1px solid {colors["dock_title_border"]};
+}}
+
+QToolButton#solutionNavExplorerButton,
+QToolButton#solutionNavSearchButton,
+QToolButton#solutionNavSettingsButton {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 0px;
+}}
+
+QToolButton#solutionNavExplorerButton:hover,
+QToolButton#solutionNavSearchButton:hover,
+QToolButton#solutionNavSettingsButton:hover {{
+    background: {colors["button_hover_bg"]};
+}}
+
+QToolButton#solutionNavExplorerButton:checked,
+QToolButton#solutionNavSearchButton:checked {{
+    background: {colors["button_bg"]};
+    border-color: {colors["button_border"]};
+}}
+
 QLabel#breadcrumbSegment {{
     color: {colors["breadcrumb_fg"]};
     padding: 0 2px;

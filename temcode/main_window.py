@@ -11,8 +11,8 @@ import time
 import webbrowser
 from datetime import datetime
 
-from PySide6.QtCore import QDir, QEvent, QFileSystemWatcher, QModelIndex, QPoint, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QKeySequence, QTextCharFormat, QTextCursor, QTextDocument
+from PySide6.QtCore import QDir, QEvent, QFileSystemWatcher, QModelIndex, QPoint, QSize, Qt, QTimer
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QIcon, QKeySequence, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QAbstractButton,
     QAbstractItemView,
@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QSpinBox,
     QStackedWidget,
+    QStyle,
     QTabBar,
     QTabWidget,
     QTextEdit,
@@ -95,6 +96,20 @@ class MainWindow(QMainWindow):
     _LSP_DID_CHANGE_DEBOUNCE_MS = 180
     _LSP_MAX_COMPLETION_ITEMS = 40
     _LSP_MAX_DIAGNOSTIC_SELECTIONS = 350
+    _MAX_WORKSPACE_SEARCH_RESULTS = 1200
+    _SEARCH_SNIPPET_MAX_LENGTH = 160
+    _SEARCH_IGNORED_DIRECTORIES = {
+        ".git",
+        ".hg",
+        ".svn",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "venv",
+        "node_modules",
+    }
     _WELCOME_TITLES = (
         "Welcome to Temcode, {user}",
         "What do you want to code today?",
@@ -176,6 +191,7 @@ class MainWindow(QMainWindow):
         self._lsp_diagnostics_by_path: dict[str, list[dict[str, object]]] = {}
         self._lsp_ready = False
         self._lsp_status_message = "idle"
+        self._solution_nav_panel = "explorer"
 
         self.setWindowTitle("Temcode")
         self.resize(1920, 980)
@@ -818,6 +834,26 @@ class MainWindow(QMainWindow):
                 if isinstance(button, QToolButton):
                     button.setFixedSize(width, height)
 
+    def _refresh_solution_nav_button_sizes(self) -> None:
+        if not hasattr(self, "solution_nav_bar"):
+            return
+
+        nav_bar_width = self._scaled_pixels(46)
+        nav_button_size = self._scaled_pixels(34)
+        nav_icon_size = self._scaled_pixels(18)
+        self.solution_nav_bar.setFixedWidth(nav_bar_width)
+
+        button_names = (
+            "solution_nav_explorer_button",
+            "solution_nav_search_button",
+            "solution_nav_settings_button",
+        )
+        for button_name in button_names:
+            button = getattr(self, button_name, None)
+            if isinstance(button, QToolButton):
+                button.setFixedSize(nav_button_size, nav_button_size)
+                button.setIconSize(QSize(nav_icon_size, nav_icon_size))
+
     def _build_solution_explorer_dock(self) -> None:
         self.solution_explorer_dock = QDockWidget("Explorer", self)
         self.solution_explorer_dock.setObjectName("solutionExplorerDock")
@@ -853,13 +889,390 @@ class MainWindow(QMainWindow):
         self.solution_explorer_stack.addWidget(self.solution_explorer_placeholder)
         self.solution_explorer_stack.addWidget(self.file_tree)
 
-        self.solution_explorer_dock.setWidget(self.solution_explorer_stack)
+        self.solution_search_page = self._build_solution_search_page(self.solution_explorer_dock)
+
+        self.solution_side_panel_stack = QStackedWidget(self.solution_explorer_dock)
+        self.solution_side_panel_stack.setObjectName("solutionSidePanelStack")
+        self.solution_side_panel_stack.addWidget(self.solution_explorer_stack)
+        self.solution_side_panel_stack.addWidget(self.solution_search_page)
+
+        dock_content = QWidget(self.solution_explorer_dock)
+        dock_content_layout = QHBoxLayout(dock_content)
+        dock_content_layout.setContentsMargins(0, 0, 0, 0)
+        dock_content_layout.setSpacing(0)
+
+        self.solution_nav_bar = QFrame(dock_content)
+        self.solution_nav_bar.setObjectName("solutionNavBar")
+        self.solution_nav_bar.setFrameShape(QFrame.Shape.NoFrame)
+        self.solution_nav_bar.setFixedWidth(self._scaled_pixels(46))
+        nav_layout = QVBoxLayout(self.solution_nav_bar)
+        nav_layout.setContentsMargins(4, 8, 4, 8)
+        nav_layout.setSpacing(4)
+
+        nav_button_size = self._scaled_pixels(34)
+        nav_icon_size = self._scaled_pixels(18)
+
+        self.solution_nav_explorer_button = self._create_solution_nav_button(
+            object_name="solutionNavExplorerButton",
+            icon_type=QStyle.StandardPixmap.SP_DirOpenIcon,
+            theme_icon_name="folder-open",
+            tooltip_text="Workspace Explorer",
+            button_size=nav_button_size,
+            icon_size=nav_icon_size,
+        )
+        self.solution_nav_explorer_button.clicked.connect(lambda _checked=False: self._show_solution_panel("explorer"))
+        nav_layout.addWidget(self.solution_nav_explorer_button, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        self.solution_nav_search_button = self._create_solution_nav_button(
+            object_name="solutionNavSearchButton",
+            icon_type=QStyle.StandardPixmap.SP_FileDialogContentsView,
+            theme_icon_name="edit-find",
+            tooltip_text="Search",
+            button_size=nav_button_size,
+            icon_size=nav_icon_size,
+        )
+        self.solution_nav_search_button.clicked.connect(lambda _checked=False: self._show_solution_panel("search"))
+        nav_layout.addWidget(self.solution_nav_search_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        nav_layout.addStretch(1)
+
+        self.solution_nav_settings_button = self._create_solution_nav_button(
+            object_name="solutionNavSettingsButton",
+            icon_type=QStyle.StandardPixmap.SP_FileDialogDetailedView,
+            theme_icon_name="preferences-system",
+            tooltip_text="Settings",
+            button_size=nav_button_size,
+            icon_size=nav_icon_size,
+            checkable=False,
+        )
+        self.solution_nav_settings_button.clicked.connect(self.open_settings_dialog)
+        nav_layout.addWidget(self.solution_nav_settings_button, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        dock_content_layout.addWidget(self.solution_nav_bar, 0)
+        dock_content_layout.addWidget(self.solution_side_panel_stack, 1)
+
+        self.solution_explorer_dock.setWidget(dock_content)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.solution_explorer_dock)
         self.solution_explorer_toggle_action.setCheckable(True)
         self.solution_explorer_toggle_action.setChecked(True)
         self.solution_explorer_toggle_action.toggled.connect(self.solution_explorer_dock.setVisible)
         self.solution_explorer_dock.visibilityChanged.connect(self._on_solution_explorer_dock_visibility_changed)
+        self._show_solution_panel("explorer")
         self._update_solution_explorer_surface()
+
+    def _create_solution_nav_button(
+        self,
+        object_name: str,
+        icon_type: QStyle.StandardPixmap,
+        theme_icon_name: str | None,
+        tooltip_text: str,
+        button_size: int,
+        icon_size: int,
+        *,
+        checkable: bool = True,
+    ) -> QToolButton:
+        button = QToolButton(self.solution_nav_bar)
+        button.setObjectName(object_name)
+        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        button.setAutoRaise(True)
+        button.setCheckable(checkable)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setFixedSize(button_size, button_size)
+        button.setIconSize(QSize(icon_size, icon_size))
+        themed_icon = QIcon.fromTheme(theme_icon_name) if theme_icon_name else QIcon()
+        button.setIcon(themed_icon if not themed_icon.isNull() else self.style().standardIcon(icon_type))
+        button.setToolTip(tooltip_text)
+        if checkable:
+            button.setAutoExclusive(True)
+        return button
+
+    def _build_solution_search_page(self, parent: QWidget) -> QWidget:
+        page = QWidget(parent)
+        page.setObjectName("solutionSearchPage")
+
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self.solution_search_input = QLineEdit(page)
+        self.solution_search_input.setPlaceholderText("Search text in file/workspace")
+        self.solution_search_input.returnPressed.connect(self._on_solution_search_requested)
+
+        controls_row = QHBoxLayout()
+        controls_row.setContentsMargins(0, 0, 0, 0)
+        controls_row.setSpacing(6)
+
+        self.solution_search_scope_combo = QComboBox(page)
+        self.solution_search_scope_combo.addItem("Current file", "current_file")
+        self.solution_search_scope_combo.addItem("Workspace", "workspace")
+
+        self.solution_search_case_checkbox = QCheckBox("Case sensitive", page)
+        self.solution_search_run_button = QPushButton("Search", page)
+        self.solution_search_run_button.clicked.connect(self._on_solution_search_requested)
+
+        controls_row.addWidget(self.solution_search_scope_combo, 0)
+        controls_row.addWidget(self.solution_search_case_checkbox, 0)
+        controls_row.addStretch(1)
+        controls_row.addWidget(self.solution_search_run_button, 0)
+
+        self.solution_search_summary_label = QLabel("Enter text and press Search.", page)
+        self.solution_search_summary_label.setWordWrap(True)
+
+        self.solution_search_results = QListWidget(page)
+        self.solution_search_results.setObjectName("solutionSearchResults")
+        self.solution_search_results.itemActivated.connect(self._on_solution_search_result_activated)
+
+        layout.addWidget(self.solution_search_input, 0)
+        layout.addLayout(controls_row)
+        layout.addWidget(self.solution_search_summary_label, 0)
+        layout.addWidget(self.solution_search_results, 1)
+        return page
+
+    def _show_solution_panel(self, panel_name: str) -> None:
+        normalized = "search" if panel_name == "search" else "explorer"
+        self._solution_nav_panel = normalized
+
+        if normalized == "search":
+            self.solution_side_panel_stack.setCurrentWidget(self.solution_search_page)
+            self.solution_nav_search_button.setChecked(True)
+            self.solution_search_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        else:
+            self.solution_side_panel_stack.setCurrentWidget(self.solution_explorer_stack)
+            self.solution_nav_explorer_button.setChecked(True)
+
+        self._refresh_solution_explorer_dock_title()
+
+    def _refresh_solution_explorer_dock_title(self) -> None:
+        if not hasattr(self, "solution_explorer_dock"):
+            return
+        if self._solution_nav_panel == "search":
+            self.solution_explorer_dock.setWindowTitle("Search")
+            return
+
+        if self.workspace_root and os.path.isdir(self.workspace_root):
+            workspace_name = os.path.basename(self.workspace_root.rstrip("\\/")) or self.workspace_root
+            self.solution_explorer_dock.setWindowTitle(f"Explorer - {workspace_name}")
+            return
+        self.solution_explorer_dock.setWindowTitle("Explorer")
+
+    def _on_solution_search_requested(self) -> None:
+        query = self.solution_search_input.text()
+        if not query:
+            self.solution_search_results.clear()
+            self.solution_search_summary_label.setText("Enter text and press Search.")
+            self.statusBar().showMessage("Search query is empty.", 1800)
+            return
+
+        scope_value = self.solution_search_scope_combo.currentData()
+        scope = scope_value if isinstance(scope_value, str) else "current_file"
+        case_sensitive = self.solution_search_case_checkbox.isChecked()
+
+        if scope == "workspace":
+            if not self.workspace_root or not os.path.isdir(self.workspace_root):
+                self.solution_search_results.clear()
+                self.solution_search_summary_label.setText("Open a workspace folder to search all files.")
+                self.statusBar().showMessage("Open a workspace folder first.", 2200)
+                return
+            matches, truncated = self._search_workspace_for_text(query, case_sensitive=case_sensitive)
+            scope_label = "workspace"
+        else:
+            if self._current_editor() is None:
+                self.solution_search_results.clear()
+                self.solution_search_summary_label.setText("Open a text file to search in the current file.")
+                self.statusBar().showMessage("Open a text file first.", 2200)
+                return
+            matches, truncated = self._search_current_file_for_text(query, case_sensitive=case_sensitive)
+            scope_label = "current file"
+
+        self.solution_search_results.clear()
+        for match in matches:
+            self._add_solution_search_result_item(match)
+
+        if matches:
+            summary_text = f"Found {len(matches)} matches in {scope_label}."
+            if truncated:
+                summary_text = (
+                    f"Found {len(matches)} matches in {scope_label} (stopped at {self._MAX_WORKSPACE_SEARCH_RESULTS})."
+                )
+        else:
+            summary_text = f"No matches found in {scope_label}."
+
+        self.solution_search_summary_label.setText(summary_text)
+        self.statusBar().showMessage(summary_text, 2600)
+        self.log(f"[search] {summary_text} query='{query}' case_sensitive={case_sensitive}")
+
+    def _search_current_file_for_text(self, query: str, *, case_sensitive: bool) -> tuple[list[dict[str, object]], bool]:
+        editor = self._current_editor()
+        if editor is None:
+            return [], False
+
+        file_path = self._editor_file_path(editor)
+        display_path = file_path or self._editor_display_name(editor)
+        editor_token_value = editor.property("autosave_token")
+        editor_token = editor_token_value if isinstance(editor_token_value, str) else None
+        search_token = editor_token if file_path is None else None
+        return self._collect_search_matches(
+            text=editor.toPlainText(),
+            query=query,
+            display_path=display_path,
+            file_path=file_path,
+            case_sensitive=case_sensitive,
+            max_results=self._MAX_WORKSPACE_SEARCH_RESULTS,
+            editor_token=search_token,
+        )
+
+    def _search_workspace_for_text(self, query: str, *, case_sensitive: bool) -> tuple[list[dict[str, object]], bool]:
+        if not self.workspace_root or not os.path.isdir(self.workspace_root):
+            return [], False
+
+        matches: list[dict[str, object]] = []
+        truncated = False
+
+        for root_path, directory_names, file_names in os.walk(self.workspace_root):
+            directory_names[:] = [name for name in directory_names if name not in self._SEARCH_IGNORED_DIRECTORIES]
+
+            for file_name in file_names:
+                full_path = os.path.join(root_path, file_name)
+                if self._is_image_file_path(full_path) or self._is_binary_file(full_path):
+                    continue
+
+                try:
+                    file_text = self._read_text_file(full_path)
+                except OSError:
+                    continue
+
+                remaining = self._MAX_WORKSPACE_SEARCH_RESULTS - len(matches)
+                if remaining <= 0:
+                    return matches, True
+
+                try:
+                    display_path = os.path.relpath(full_path, self.workspace_root)
+                except ValueError:
+                    display_path = full_path
+
+                file_matches, file_truncated = self._collect_search_matches(
+                    text=file_text,
+                    query=query,
+                    display_path=display_path,
+                    file_path=full_path,
+                    case_sensitive=case_sensitive,
+                    max_results=remaining,
+                )
+                if file_matches:
+                    matches.extend(file_matches)
+                if file_truncated:
+                    truncated = True
+                    return matches, truncated
+
+        return matches, truncated
+
+    def _collect_search_matches(
+        self,
+        text: str,
+        query: str,
+        display_path: str,
+        file_path: str | None,
+        *,
+        case_sensitive: bool,
+        max_results: int,
+        editor_token: str | None = None,
+    ) -> tuple[list[dict[str, object]], bool]:
+        if max_results <= 0 or not query:
+            return [], False
+
+        matches: list[dict[str, object]] = []
+        needle = query if case_sensitive else query.lower()
+        step_size = max(1, len(query))
+
+        for line_number, raw_line in enumerate(text.splitlines(), start=1):
+            searchable_line = raw_line if case_sensitive else raw_line.lower()
+            start_index = 0
+
+            while True:
+                match_index = searchable_line.find(needle, start_index)
+                if match_index < 0:
+                    break
+
+                snippet = raw_line.strip()
+                if len(snippet) > self._SEARCH_SNIPPET_MAX_LENGTH:
+                    snippet = snippet[: self._SEARCH_SNIPPET_MAX_LENGTH - 1] + "..."
+
+                matches.append(
+                    {
+                        "display_path": display_path,
+                        "file_path": file_path,
+                        "line": line_number,
+                        "column": match_index + 1,
+                        "snippet": snippet,
+                        "editor_token": editor_token,
+                    }
+                )
+
+                if len(matches) >= max_results:
+                    return matches, True
+
+                start_index = match_index + step_size
+
+        return matches, False
+
+    def _add_solution_search_result_item(self, payload: dict[str, object]) -> None:
+        display_path = payload.get("display_path") if isinstance(payload.get("display_path"), str) else "<unknown>"
+        line_value = payload.get("line")
+        column_value = payload.get("column")
+        line_number = int(line_value) if isinstance(line_value, int) else 1
+        column_number = int(column_value) if isinstance(column_value, int) else 1
+        snippet = payload.get("snippet") if isinstance(payload.get("snippet"), str) else ""
+        text = f"{display_path}:{line_number}:{column_number}  {snippet}"
+
+        item = QListWidgetItem(text)
+        item.setData(Qt.ItemDataRole.UserRole, payload)
+        item.setToolTip(text)
+        self.solution_search_results.addItem(item)
+
+    def _on_solution_search_result_activated(self, item: QListWidgetItem) -> None:
+        payload = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(payload, dict):
+            return
+
+        line_value = payload.get("line")
+        column_value = payload.get("column")
+        try:
+            line = max(0, int(line_value) - 1)
+            column = max(0, int(column_value) - 1)
+        except (TypeError, ValueError):
+            line = 0
+            column = 0
+
+        file_path = payload.get("file_path")
+        if isinstance(file_path, str) and file_path:
+            self._jump_to_file_location(file_path, line, column)
+            return
+
+        editor = self._resolve_editor_from_search_payload(payload)
+        if editor is None:
+            self.statusBar().showMessage("Search source is no longer open.", 2200)
+            return
+
+        self._jump_to_editor_location(editor, line, column)
+        self.statusBar().showMessage(f"Search: line {line + 1}, column {column + 1}", 2200)
+
+    def _resolve_editor_from_search_payload(self, payload: dict[str, object]) -> CodeEditor | None:
+        token_value = payload.get("editor_token")
+        if isinstance(token_value, str) and token_value:
+            for editor in self._open_editors():
+                editor_token_value = editor.property("autosave_token")
+                if isinstance(editor_token_value, str) and editor_token_value == token_value:
+                    return editor
+            return None
+        return self._current_editor()
+
+    @staticmethod
+    def _is_binary_file(file_path: str) -> bool:
+        try:
+            with open(file_path, "rb") as handle:
+                sample = handle.read(4096)
+        except OSError:
+            return False
+        return b"\x00" in sample
 
     def _update_solution_explorer_surface(self) -> None:
         if not hasattr(self, "solution_explorer_stack"):
@@ -869,6 +1282,7 @@ class MainWindow(QMainWindow):
             self.solution_explorer_stack.setCurrentWidget(self.file_tree)
         else:
             self.solution_explorer_stack.setCurrentWidget(self.solution_explorer_placeholder)
+        self._refresh_solution_explorer_dock_title()
 
     def _build_output_dock(self) -> None:
         self.output_dock = QDockWidget("Output", self)
@@ -1086,7 +1500,6 @@ class MainWindow(QMainWindow):
 
         root_index = self.fs_model.setRootPath("")
         self.file_tree.setRootIndex(root_index)
-        self.solution_explorer_dock.setWindowTitle("Explorer")
         self.setWindowTitle("Temcode")
 
         if self.terminal_console is not None:
@@ -1112,8 +1525,6 @@ class MainWindow(QMainWindow):
         index = self.fs_model.setRootPath(normalized)
         self.file_tree.setRootIndex(index)
         self.workspace_root = normalized
-        workspace_name = os.path.basename(normalized.rstrip("\\/")) or normalized
-        self.solution_explorer_dock.setWindowTitle(f"Explorer - {workspace_name}")
         self.setWindowTitle(f"Temcode - {normalized}")
         self.statusBar().showMessage(f"Workspace: {normalized}", 3000)
         self.log(f"[workspace] Opened folder: {normalized}")
@@ -2340,6 +2751,23 @@ class MainWindow(QMainWindow):
                     return resolved
         return None
 
+    def _jump_to_editor_location(self, editor: CodeEditor, line: int, character: int) -> None:
+        tab_widget = self._find_tab_widget_for_editor(editor)
+        if tab_widget is not None:
+            tab_index = tab_widget.indexOf(editor)
+            if tab_index >= 0:
+                tab_widget.setCurrentIndex(tab_index)
+                self._set_active_tab_widget(tab_widget)
+
+        safe_line = max(0, int(line))
+        safe_character = max(0, int(character))
+        target_offset = self._lsp_position_to_cursor_offset(editor, safe_line, safe_character)
+        cursor = editor.textCursor()
+        cursor.setPosition(max(0, target_offset))
+        editor.setTextCursor(cursor)
+        editor.centerCursor()
+        editor.setFocus()
+
     def _jump_to_file_location(self, file_path: str, line: int, character: int) -> None:
         self.open_file(file_path)
         key = self._normalize_path(file_path)
@@ -2347,12 +2775,7 @@ class MainWindow(QMainWindow):
         if editor is None:
             return
 
-        target_offset = self._lsp_position_to_cursor_offset(editor, line, character)
-        cursor = editor.textCursor()
-        cursor.setPosition(max(0, target_offset))
-        editor.setTextCursor(cursor)
-        editor.centerCursor()
-        editor.setFocus()
+        self._jump_to_editor_location(editor, line, character)
         self.statusBar().showMessage(f"Definition: {file_path}:{line + 1}", 2600)
 
     def rename_symbol(self) -> None:
@@ -3004,6 +3427,7 @@ class MainWindow(QMainWindow):
         for editor in self._open_editors():
             editor.set_theme(normalized_theme)
         self._refresh_tab_close_button_sizes()
+        self._refresh_solution_nav_button_sizes()
 
     def _workspace_settings_dir(self) -> str:
         source_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
