@@ -4,12 +4,14 @@ import json
 import os
 import shutil
 import hashlib
+import re
+import subprocess
 import time
 import webbrowser
 from datetime import datetime
 
 from PySide6.QtCore import QDir, QFileSystemWatcher, QModelIndex, QPoint, Qt, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence, QTextCursor, QTextDocument
+from PySide6.QtGui import QAction, QActionGroup, QColor, QCloseEvent, QKeySequence, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -46,7 +48,8 @@ from PySide6.QtWidgets import (
 )
 
 from temcode import __version__
-from temcode.editor import CodeEditor
+from temcode.editor import CodeEditor, ImageViewer, LanguageId
+from temcode.lsp import LspClient, uri_to_path
 from temcode.terminal import CmdTerminalWidget
 from temcode.ui.style import (
     DEFAULT_THEME_ID,
@@ -78,16 +81,33 @@ class MainWindow(QMainWindow):
     _MIN_UI_ZOOM_PERCENT = 70
     _MAX_UI_ZOOM_PERCENT = 200
     _UI_ZOOM_STEP_PERCENT = 10
+    _MIN_CODE_ZOOM_POINT_SIZE = CodeEditor._MIN_ZOOM_POINT_SIZE
+    _MAX_CODE_ZOOM_POINT_SIZE = CodeEditor._MAX_ZOOM_POINT_SIZE
     _TAB_CLOSE_BUTTON_BASE_WIDTH = 24
     _TAB_CLOSE_BUTTON_BASE_HEIGHT = 20
     _MIN_WINDOW_WIDTH = 640
     _MIN_WINDOW_HEIGHT = 420
     _GITHUB_REPO_URL = "https://github.com/temal32/temcode"
+    _LSP_DID_CHANGE_DEBOUNCE_MS = 180
+    _LSP_MAX_COMPLETION_ITEMS = 40
+    _LSP_MAX_DIAGNOSTIC_SELECTIONS = 350
+    _IMAGE_FILE_EXTENSIONS = {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".bmp",
+        ".gif",
+        ".webp",
+        ".tif",
+        ".tiff",
+        ".ico",
+    }
 
     def __init__(self) -> None:
         super().__init__()
         self.workspace_root: str | None = None
         self._open_editors_by_path: dict[str, CodeEditor] = {}
+        self._open_image_tabs_by_path: dict[str, ImageViewer] = {}
         self._untitled_counter = 1
         self._active_editor_tabs: QTabWidget | None = None
         self._find_highlight_editor: CodeEditor | None = None
@@ -96,6 +116,7 @@ class MainWindow(QMainWindow):
         self._autosave_last_summary = ""
         self._theme_id = self._DEFAULT_THEME_ID
         self._ui_zoom_percent = self._DEFAULT_UI_ZOOM_PERCENT
+        self._code_zoom_point_size: float | None = None
         self._settings_file_path: str | None = None
         self._recent_paths_file_path: str | None = None
         self._recent_paths: list[str] = []
@@ -118,6 +139,11 @@ class MainWindow(QMainWindow):
         self._recent_internal_writes: dict[str, float] = {}
         self._external_change_prompts: set[str] = set()
         self.terminal_console: CmdTerminalWidget | None = None
+        self._lsp_client = LspClient(self)
+        self._lsp_document_timers: dict[int, QTimer] = {}
+        self._lsp_diagnostics_by_path: dict[str, list[dict[str, object]]] = {}
+        self._lsp_ready = False
+        self._lsp_status_message = "idle"
 
         self.setWindowTitle("Temcode")
         self.resize(1920, 980)
@@ -128,12 +154,16 @@ class MainWindow(QMainWindow):
         self._build_solution_explorer_dock()
         self._build_output_dock()
         self._build_terminal_dock()
+        self._lsp_client.ready_changed.connect(self._on_lsp_ready_changed)
+        self._lsp_client.diagnostics_published.connect(self._on_lsp_diagnostics_published)
+        self._lsp_client.log_message.connect(lambda message: self.log(f"[lsp] {message}"))
 
         self._load_workspace_settings()
         self._load_recent_paths()
         self._sync_file_watcher_paths()
         self._refresh_breadcrumbs()
         self._update_solution_explorer_surface()
+        self._refresh_lsp_status_label()
         self._file_poll_timer.start()
 
     def should_start_maximized(self) -> bool:
@@ -143,6 +173,7 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("&File")
         edit_menu = self.menuBar().addMenu("&Edit")
         view_menu = self.menuBar().addMenu("&View")
+        code_menu = self.menuBar().addMenu("&Code")
         help_menu = self.menuBar().addMenu("&Help")
 
         self.new_file_action = QAction("&New File", self)
@@ -207,6 +238,22 @@ class MainWindow(QMainWindow):
         self.settings_action.setShortcut(QKeySequence("Ctrl+,"))
         self.settings_action.triggered.connect(self.open_settings_dialog)
         edit_menu.addAction(self.settings_action)
+
+        self.trigger_completion_action = QAction("Trigger Completion", self)
+        self.trigger_completion_action.setShortcut(QKeySequence("Ctrl+Space"))
+        self.trigger_completion_action.triggered.connect(self.trigger_lsp_completion)
+
+        self.go_to_definition_action = QAction("Go To Definition", self)
+        self.go_to_definition_action.setShortcut(QKeySequence("F12"))
+        self.go_to_definition_action.triggered.connect(self.go_to_definition)
+
+        self.rename_symbol_action = QAction("Rename Symbol", self)
+        self.rename_symbol_action.setShortcut(QKeySequence("F2"))
+        self.rename_symbol_action.triggered.connect(self.rename_symbol)
+
+        code_menu.addAction(self.trigger_completion_action)
+        code_menu.addAction(self.go_to_definition_action)
+        code_menu.addAction(self.rename_symbol_action)
 
         self.solution_explorer_toggle_action = QAction("Explorer", self)
         self.output_toggle_action = QAction("Output", self)
@@ -284,9 +331,12 @@ class MainWindow(QMainWindow):
         self.large_file_status_label = QLabel("")
         self.large_file_status_label.setObjectName("largeFileStatusLabel")
         self.large_file_status_label.setStyleSheet("color: #f0c674; font-weight: 600;")
+        self.lsp_status_label = QLabel("LSP: idle")
+        self.lsp_status_label.setObjectName("lspStatusLabel")
         self.statusBar().addPermanentWidget(self.autosave_status_label)
         self.statusBar().addPermanentWidget(self.language_status_label)
         self.statusBar().addPermanentWidget(self.large_file_status_label)
+        self.statusBar().addPermanentWidget(self.lsp_status_label)
 
     def _open_github_repo(self) -> None:
         opened = webbrowser.open(self._GITHUB_REPO_URL, new=2, autoraise=True)
@@ -538,17 +588,17 @@ class MainWindow(QMainWindow):
         self._write_recent_paths()
         self._refresh_welcome_recent_list()
 
-    def _refresh_breadcrumbs(self, editor: CodeEditor | None = None) -> None:
-        target_editor = editor if editor is not None else self._current_editor()
-        self._render_breadcrumbs(self._breadcrumb_segments_for_editor(target_editor))
+    def _refresh_breadcrumbs(self, widget: QWidget | None = None) -> None:
+        target_widget = widget if widget is not None else self._current_tab_widget()
+        self._render_breadcrumbs(self._breadcrumb_segments_for_widget(target_widget))
 
-    def _breadcrumb_segments_for_editor(self, editor: CodeEditor | None) -> list[str]:
-        if editor is None:
+    def _breadcrumb_segments_for_widget(self, widget: QWidget | None) -> list[str]:
+        if widget is None:
             return ["Workspace"]
 
-        file_path = self._editor_file_path(editor)
+        file_path = self._widget_file_path(widget)
         if not file_path:
-            return ["Workspace", self._editor_display_name(editor)]
+            return ["Workspace", self._widget_display_name(widget)]
 
         absolute_path = os.path.abspath(file_path)
         if self.workspace_root and self._is_same_or_child(absolute_path, self.workspace_root):
@@ -603,12 +653,12 @@ class MainWindow(QMainWindow):
         )
         return tabs
 
-    def _add_editor_tab(self, tabs: QTabWidget, editor: CodeEditor, title: str) -> int:
-        tab_index = tabs.addTab(editor, title)
-        self._set_editor_tab_close_button(tabs, tab_index, editor)
+    def _add_editor_tab(self, tabs: QTabWidget, widget: QWidget, title: str) -> int:
+        tab_index = tabs.addTab(widget, title)
+        self._set_editor_tab_close_button(tabs, tab_index, widget)
         return tab_index
 
-    def _set_editor_tab_close_button(self, tabs: QTabWidget, tab_index: int, editor: CodeEditor) -> None:
+    def _set_editor_tab_close_button(self, tabs: QTabWidget, tab_index: int, widget: QWidget) -> None:
         close_button = QToolButton(tabs.tabBar())
         close_button.setObjectName("editorTabCloseButton")
         close_button.setText("X")
@@ -621,21 +671,21 @@ class MainWindow(QMainWindow):
         )
         close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         close_button.clicked.connect(
-            lambda _checked=False, t=tabs, e=editor: self._close_editor_from_tab_button(t, e)
+            lambda _checked=False, t=tabs, w=widget: self._close_editor_from_tab_button(t, w)
         )
         tabs.tabBar().setTabButton(tab_index, QTabBar.ButtonPosition.RightSide, close_button)
 
-    def _close_editor_from_tab_button(self, tabs: QTabWidget, editor: CodeEditor) -> None:
-        tab_index = tabs.indexOf(editor)
+    def _close_editor_from_tab_button(self, tabs: QTabWidget, widget: QWidget) -> None:
+        tab_index = tabs.indexOf(widget)
         if tab_index >= 0:
             self._request_close_tab(tabs, tab_index)
             return
 
-        owner_tabs = self._find_tab_widget_for_editor(editor)
+        owner_tabs = self._find_tab_widget_for_editor(widget)
         if owner_tabs is None:
             return
 
-        owner_index = owner_tabs.indexOf(editor)
+        owner_index = owner_tabs.indexOf(widget)
         if owner_index >= 0:
             self._request_close_tab(owner_tabs, owner_index)
 
@@ -794,7 +844,15 @@ class MainWindow(QMainWindow):
 
     def open_file_dialog(self) -> None:
         start_dir = self.workspace_root or os.getcwd()
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open File", start_dir, "All Files (*.*)")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open File",
+            start_dir,
+            (
+                "All Files (*.*);;"
+                "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff *.ico)"
+            ),
+        )
         if file_path:
             self.open_file(file_path)
 
@@ -848,6 +906,9 @@ class MainWindow(QMainWindow):
         if self.terminal_console is not None:
             self.terminal_console.set_working_directory(os.getcwd())
 
+        self._lsp_diagnostics_by_path.clear()
+        self._lsp_client.stop()
+        self._refresh_lsp_status_label()
         self._sync_file_watcher_paths()
         self._update_editor_mode_status(None)
         self._refresh_breadcrumbs(None)
@@ -876,6 +937,9 @@ class MainWindow(QMainWindow):
             self._record_recent_path(normalized)
         if self.terminal_console is not None:
             self.terminal_console.set_working_directory(normalized)
+        self._lsp_client.stop()
+        for editor in self._open_editors():
+            self._schedule_lsp_document_sync(editor, immediate=True)
         self._sync_file_watcher_paths()
         self._refresh_breadcrumbs()
         self._update_solution_explorer_surface()
@@ -921,9 +985,22 @@ class MainWindow(QMainWindow):
         if tab_index < 0:
             return
 
+        widget = self._tab_widget_at(tabs, tab_index)
+        if widget is None:
+            return
+
+        file_path = self._widget_file_path(widget)
         menu = QMenu(self)
         move_action = menu.addAction("Move To Other Split")
         close_action = menu.addAction("Close")
+        close_all_action = menu.addAction("Close All")
+        menu.addSeparator()
+        copy_path_action = menu.addAction("Copy Path")
+        open_in_explorer_action = menu.addAction("Open in Explorer")
+
+        has_file_path = bool(file_path)
+        copy_path_action.setEnabled(has_file_path)
+        open_in_explorer_action.setEnabled(has_file_path)
 
         selected = menu.exec(tabs.tabBar().mapToGlobal(pos))
         if selected == move_action:
@@ -932,6 +1009,18 @@ class MainWindow(QMainWindow):
             self.move_current_tab_to_other_split()
         elif selected == close_action:
             self._request_close_tab(tabs, tab_index)
+        elif selected == close_all_action:
+            self._set_active_tab_widget(tabs)
+            self._close_all_open_editors()
+        elif selected == copy_path_action and file_path:
+            QApplication.clipboard().setText(os.path.abspath(file_path))
+            self.statusBar().showMessage(f"Copied path: {os.path.abspath(file_path)}", 2500)
+        elif selected == open_in_explorer_action and file_path:
+            absolute_path = os.path.abspath(file_path)
+            try:
+                subprocess.Popen(["explorer", f"/select,{os.path.normpath(absolute_path)}"])
+            except OSError as exc:
+                self._show_error("Open in Explorer", absolute_path, exc)
 
     def new_file(self) -> None:
         display_name = f"Untitled-{self._untitled_counter}"
@@ -1065,6 +1154,11 @@ class MainWindow(QMainWindow):
     def open_file(self, file_path: str) -> None:
         absolute_path = os.path.abspath(file_path)
         self._ensure_workspace_for_file(absolute_path)
+
+        if self._is_image_file_path(absolute_path):
+            self._open_image_file(absolute_path)
+            return
+
         key = self._normalize_path(absolute_path)
 
         existing_editor = self._open_editors_by_path.get(key)
@@ -1076,8 +1170,10 @@ class MainWindow(QMainWindow):
                 self._reveal_path(absolute_path)
                 self._update_editor_mode_status(existing_editor)
                 self._refresh_breadcrumbs(existing_editor)
+                self._apply_lsp_diagnostics_to_editor(existing_editor)
                 self._record_file_disk_state(absolute_path)
                 self._record_recent_path(absolute_path)
+                self._schedule_lsp_document_sync(existing_editor, immediate=True)
                 self._update_editor_surface()
                 existing_editor.setFocus()
                 return
@@ -1116,6 +1212,59 @@ class MainWindow(QMainWindow):
         self._update_editor_surface()
         self._update_editor_mode_status(editor)
         self._refresh_breadcrumbs(editor)
+        self._apply_lsp_diagnostics_to_editor(editor)
+        self._schedule_lsp_document_sync(editor, immediate=True)
+
+    def _open_image_file(self, file_path: str) -> None:
+        absolute_path = os.path.abspath(file_path)
+        key = self._normalize_path(absolute_path)
+
+        existing_viewer = self._open_image_tabs_by_path.get(key)
+        if existing_viewer is not None:
+            tab_widget = self._find_tab_widget_for_editor(existing_viewer)
+            if tab_widget is not None:
+                tab_widget.setCurrentWidget(existing_viewer)
+                self._set_active_tab_widget(tab_widget)
+                self._reveal_path(absolute_path)
+                self._update_editor_mode_status(existing_viewer)
+                self._refresh_breadcrumbs(existing_viewer)
+                self._record_file_disk_state(absolute_path)
+                self._record_recent_path(absolute_path)
+                self._update_editor_surface()
+                existing_viewer.setFocus()
+                return
+            self._open_image_tabs_by_path.pop(key, None)
+
+        viewer = ImageViewer(absolute_path, self)
+        if not viewer.reload_image():
+            QMessageBox.warning(self, "Open Image", f"Could not decode image:\n{absolute_path}")
+            return
+
+        viewer.setProperty("file_path", absolute_path)
+        viewer.setProperty("display_name", os.path.basename(absolute_path))
+
+        target_tabs = self._active_editor_tabs or self.primary_tabs
+        tab_index = self._add_editor_tab(target_tabs, viewer, os.path.basename(absolute_path))
+        target_tabs.setCurrentIndex(tab_index)
+        self._set_active_tab_widget(target_tabs)
+
+        self._open_image_tabs_by_path[key] = viewer
+        self._record_file_disk_state(absolute_path)
+        self._record_recent_path(absolute_path)
+        self._sync_file_watcher_paths()
+        self._update_editor_tab_title(viewer)
+        self.statusBar().showMessage(f"Opened image {absolute_path}", 2500)
+        self.log(f"[viewer] Opened image: {absolute_path}")
+        self._reveal_path(absolute_path)
+        self._update_editor_surface()
+        self._update_editor_mode_status(viewer)
+        self._refresh_breadcrumbs(viewer)
+        viewer.setFocus()
+
+    @classmethod
+    def _is_image_file_path(cls, file_path: str) -> bool:
+        extension = os.path.splitext(file_path)[1].lower()
+        return extension in cls._IMAGE_FILE_EXTENSIONS
 
     def _ensure_workspace_for_file(self, file_path: str) -> None:
         absolute_path = os.path.abspath(file_path)
@@ -1285,12 +1434,18 @@ class MainWindow(QMainWindow):
     def save_current_file(self) -> bool:
         editor = self._current_editor()
         if editor is None:
+            active_widget = self._current_tab_widget()
+            if isinstance(active_widget, ImageViewer):
+                self.statusBar().showMessage("Image tabs are read-only.", 2200)
             return False
         return self._save_editor(editor, save_as=False)
 
     def save_current_file_as(self) -> bool:
         editor = self._current_editor()
         if editor is None:
+            active_widget = self._current_tab_widget()
+            if isinstance(active_widget, ImageViewer):
+                self.statusBar().showMessage("Image tabs are read-only.", 2200)
             return False
         return self._save_editor(editor, save_as=True)
 
@@ -1325,6 +1480,14 @@ class MainWindow(QMainWindow):
                 f"Cannot save to this path because it is already open in another tab:\n{absolute_target}",
             )
             return False
+        existing_viewer = self._open_image_tabs_by_path.get(target_key)
+        if existing_viewer is not None:
+            QMessageBox.warning(
+                self,
+                "Save File",
+                f"Cannot save to this path because it is open as an image tab:\n{absolute_target}",
+            )
+            return False
 
         try:
             with open(absolute_target, "w", encoding="utf-8", newline="") as handle:
@@ -1338,6 +1501,8 @@ class MainWindow(QMainWindow):
             self._open_editors_by_path.pop(self._normalize_path(current_path), None)
             if not self._paths_equal(current_path, absolute_target):
                 self._file_disk_state.pop(self._normalize_path(current_path), None)
+                self._lsp_client.close_document(current_path)
+                self._clear_lsp_diagnostics_for_path(current_path)
         editor.setProperty("file_path", absolute_target)
         self._open_editors_by_path[target_key] = editor
         self._record_file_disk_state(absolute_target)
@@ -1352,6 +1517,8 @@ class MainWindow(QMainWindow):
         self._reveal_path(absolute_target)
         self._update_editor_mode_status(editor)
         self._refresh_breadcrumbs(editor)
+        self._schedule_lsp_document_sync(editor, immediate=True)
+        self._apply_lsp_diagnostics_to_editor(editor)
         self.statusBar().showMessage(f"Saved {absolute_target}", 2500)
         self.log(f"[editor] Saved file: {absolute_target}")
         if large_file_mode:
@@ -1376,13 +1543,42 @@ class MainWindow(QMainWindow):
         editor.setProperty("large_file_mode_reason", large_file_reason)
         editor.setProperty("autosave_token", f"editor-{id(editor):x}")
         editor.configure_syntax_highlighting(file_path, large_file_mode)
+        self._apply_code_zoom_to_editor(editor)
         editor.document().modificationChanged.connect(lambda _v, e=editor: self._update_editor_tab_title(e))
         editor.textChanged.connect(lambda e=editor: self._on_editor_text_changed(e))
+        editor.code_zoom_changed.connect(lambda point_size, e=editor: self._on_editor_code_zoom_changed(e, point_size))
+        editor.destroyed.connect(lambda _obj=None, key=id(editor): self._cleanup_lsp_timer(key))
         return editor
+
+    def _clamp_code_zoom_point_size(self, point_size: float) -> float:
+        return max(
+            self._MIN_CODE_ZOOM_POINT_SIZE,
+            min(self._MAX_CODE_ZOOM_POINT_SIZE, float(point_size)),
+        )
+
+    def _apply_code_zoom_to_editor(self, editor: CodeEditor) -> None:
+        if self._code_zoom_point_size is None:
+            return
+        editor.set_code_zoom_point_size(self._code_zoom_point_size, emit_signal=False)
+
+    def _apply_code_zoom_to_open_editors(self, source_editor: CodeEditor | None = None) -> None:
+        if self._code_zoom_point_size is None:
+            return
+        for editor in self._open_editors():
+            if source_editor is not None and editor is source_editor:
+                continue
+            editor.set_code_zoom_point_size(self._code_zoom_point_size, emit_signal=False)
+
+    def _on_editor_code_zoom_changed(self, source_editor: CodeEditor, point_size: float) -> None:
+        self._code_zoom_point_size = self._clamp_code_zoom_point_size(point_size)
+        self._apply_code_zoom_to_open_editors(source_editor=source_editor)
+        if not self._suspend_ui_settings_persistence and not self._is_app_closing:
+            self._persist_ui_settings()
 
     def _on_editor_text_changed(self, editor: CodeEditor) -> None:
         if self.find_panel.isVisible() and editor is self._current_editor():
             self._refresh_find_highlights()
+        self._schedule_lsp_document_sync(editor)
 
     def _evaluate_large_file_mode(self, file_path: str | None, content: str) -> tuple[bool, str]:
         size_bytes = len(content.encode("utf-8", errors="ignore"))
@@ -1402,22 +1598,842 @@ class MainWindow(QMainWindow):
 
         return bool(reasons), ", ".join(reasons)
 
-    def _update_editor_mode_status(self, editor: CodeEditor | None) -> None:
-        if editor is None:
+    def _update_editor_mode_status(self, widget: QWidget | None) -> None:
+        if widget is None:
             self.language_status_label.setText("Plain Text")
             self.large_file_status_label.setText("")
             self.large_file_status_label.setToolTip("")
+            self._refresh_lsp_status_label()
             return
 
-        self.language_status_label.setText(editor.language_display_name())
+        if isinstance(widget, ImageViewer):
+            dimensions = widget.image_dimensions_text()
+            self.language_status_label.setText("Image")
+            self.large_file_status_label.setText(dimensions)
+            self.large_file_status_label.setToolTip(widget.file_path())
+            self._refresh_lsp_status_label()
+            return
+
+        if isinstance(widget, CodeEditor):
+            self.language_status_label.setText(widget.language_display_name())
+            if widget.is_large_file_mode():
+                reason_value = widget.property("large_file_mode_reason")
+                reason = reason_value if isinstance(reason_value, str) else ""
+                self.large_file_status_label.setText("Large File Mode")
+                self.large_file_status_label.setToolTip(reason or "Large file optimizations enabled.")
+            else:
+                self.large_file_status_label.setText("")
+                self.large_file_status_label.setToolTip("")
+            self._refresh_lsp_status_label()
+            return
+
+        self.language_status_label.setText("Plain Text")
+        self.large_file_status_label.setText("")
+        self.large_file_status_label.setToolTip("")
+        self._refresh_lsp_status_label()
+
+    def _lsp_workspace_root(self, editor: CodeEditor | None = None) -> str:
+        if self.workspace_root and os.path.isdir(self.workspace_root):
+            return os.path.abspath(self.workspace_root)
+
+        if editor is not None:
+            editor_path = self._editor_file_path(editor)
+            if editor_path:
+                parent_dir = os.path.dirname(os.path.abspath(editor_path))
+                if os.path.isdir(parent_dir):
+                    return parent_dir
+
+        return os.getcwd()
+
+    def _should_use_lsp_for_editor(self, editor: CodeEditor | None) -> bool:
+        if editor is None:
+            return False
+        if editor.language_id() != LanguageId.PYTHON:
+            return False
         if editor.is_large_file_mode():
-            reason_value = editor.property("large_file_mode_reason")
-            reason = reason_value if isinstance(reason_value, str) else ""
-            self.large_file_status_label.setText("Large File Mode")
-            self.large_file_status_label.setToolTip(reason or "Large file optimizations enabled.")
+            return False
+        file_path = self._editor_file_path(editor)
+        return isinstance(file_path, str) and bool(file_path)
+
+    def _cleanup_lsp_timer(self, editor_key: int) -> None:
+        self._lsp_document_timers.pop(editor_key, None)
+
+    def _lsp_sync_timer_for_editor(self, editor: CodeEditor) -> QTimer:
+        editor_key = id(editor)
+        timer = self._lsp_document_timers.get(editor_key)
+        if timer is not None:
+            return timer
+
+        timer = QTimer(editor)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda e=editor: self._sync_editor_document_with_lsp(e))
+        self._lsp_document_timers[editor_key] = timer
+        return timer
+
+    def _ensure_lsp_ready_for_editor(self, editor: CodeEditor) -> bool:
+        workspace_root = self._lsp_workspace_root(editor)
+        if not self._lsp_client.ensure_started(workspace_root):
+            self._refresh_lsp_status_label()
+            return False
+        return True
+
+    def _schedule_lsp_document_sync(self, editor: CodeEditor, immediate: bool = False) -> None:
+        if not self._should_use_lsp_for_editor(editor):
+            editor.set_diagnostic_extra_selections([])
+            self._refresh_lsp_status_label()
+            return
+
+        timer = self._lsp_sync_timer_for_editor(editor)
+        if immediate:
+            timer.stop()
+            self._sync_editor_document_with_lsp(editor)
+            return
+
+        timer.start(self._LSP_DID_CHANGE_DEBOUNCE_MS)
+
+    def _sync_editor_document_with_lsp(self, editor: CodeEditor) -> None:
+        if not self._should_use_lsp_for_editor(editor):
+            return
+        if not self._ensure_lsp_ready_for_editor(editor):
+            return
+
+        file_path = self._editor_file_path(editor)
+        if not file_path:
+            return
+
+        self._lsp_client.open_or_change_document(file_path, editor.toPlainText(), language_id="python")
+
+    def _close_lsp_document(self, editor: CodeEditor) -> None:
+        file_path = self._editor_file_path(editor)
+        if file_path:
+            self._lsp_client.close_document(file_path)
+        editor.set_diagnostic_extra_selections([])
+        self._refresh_lsp_status_label()
+
+    def _clear_lsp_diagnostics_for_path(self, file_path: str) -> None:
+        normalized_key = self._normalize_path(file_path)
+        self._lsp_diagnostics_by_path.pop(normalized_key, None)
+
+        for editor in self._open_editors():
+            editor_path = self._editor_file_path(editor)
+            if editor_path and self._normalize_path(editor_path) == normalized_key:
+                editor.set_diagnostic_extra_selections([])
+
+        self._refresh_lsp_status_label()
+
+    def _on_lsp_ready_changed(self, ready: bool, status_message: str) -> None:
+        self._lsp_ready = ready
+        self._lsp_status_message = status_message
+
+        if not ready:
+            self._lsp_diagnostics_by_path.clear()
+            for editor in self._open_editors():
+                editor.set_diagnostic_extra_selections([])
+            self._refresh_lsp_status_label()
+            return
+
+        for editor in self._open_editors():
+            self._schedule_lsp_document_sync(editor, immediate=True)
+            self._apply_lsp_diagnostics_to_editor(editor)
+        self._refresh_lsp_status_label()
+
+    def _on_lsp_diagnostics_published(self, uri: str, diagnostics_payload: object) -> None:
+        file_path = uri_to_path(uri)
+        if not file_path:
+            return
+
+        normalized_key = self._normalize_path(file_path)
+        if isinstance(diagnostics_payload, list):
+            diagnostics = [entry for entry in diagnostics_payload if isinstance(entry, dict)]
         else:
-            self.large_file_status_label.setText("")
-            self.large_file_status_label.setToolTip("")
+            diagnostics = []
+        self._lsp_diagnostics_by_path[normalized_key] = diagnostics
+
+        for editor in self._open_editors():
+            editor_path = self._editor_file_path(editor)
+            if editor_path and self._normalize_path(editor_path) == normalized_key:
+                self._apply_lsp_diagnostics_to_editor(editor)
+
+        self._refresh_lsp_status_label()
+
+    def _apply_lsp_diagnostics_to_editor(self, editor: CodeEditor) -> None:
+        if not self._should_use_lsp_for_editor(editor):
+            editor.set_diagnostic_extra_selections([])
+            self._refresh_lsp_status_label()
+            return
+
+        file_path = self._editor_file_path(editor)
+        if not file_path:
+            editor.set_diagnostic_extra_selections([])
+            self._refresh_lsp_status_label()
+            return
+
+        diagnostics = self._lsp_diagnostics_by_path.get(self._normalize_path(file_path), [])
+        selections = self._build_lsp_diagnostic_selections(editor, diagnostics)
+        editor.set_diagnostic_extra_selections(selections)
+        self._refresh_lsp_status_label()
+
+    def _build_lsp_diagnostic_selections(
+        self,
+        editor: CodeEditor,
+        diagnostics: list[dict[str, object]],
+    ) -> list[QTextEdit.ExtraSelection]:
+        selections: list[QTextEdit.ExtraSelection] = []
+        max_position = max(0, editor.document().characterCount() - 1)
+
+        for diagnostic in diagnostics[: self._LSP_MAX_DIAGNOSTIC_SELECTIONS]:
+            range_payload = diagnostic.get("range")
+            if not isinstance(range_payload, dict):
+                continue
+
+            severity_value = diagnostic.get("severity")
+            try:
+                severity = int(severity_value) if severity_value is not None else 2
+            except (TypeError, ValueError):
+                severity = 2
+
+            message_value = diagnostic.get("message")
+            message = message_value if isinstance(message_value, str) else ""
+            cursor = self._range_to_cursor(editor, range_payload)
+
+            if not cursor.hasSelection() and max_position > 0:
+                anchor = min(max(0, cursor.position()), max_position - 1)
+                cursor.setPosition(anchor)
+                cursor.setPosition(anchor + 1, QTextCursor.MoveMode.KeepAnchor)
+
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = cursor
+            selection.format.setUnderlineStyle(QTextCharFormat.UnderlineStyle.SpellCheckUnderline)
+            selection.format.setUnderlineColor(self._diagnostic_color_for_severity(severity))
+            if message:
+                selection.format.setToolTip(message)
+            selections.append(selection)
+
+        return selections
+
+    def _cursor_to_lsp_position(self, editor: CodeEditor) -> tuple[int, int]:
+        cursor = editor.textCursor()
+        block = cursor.block()
+        line = max(0, block.blockNumber())
+        character = max(0, cursor.position() - block.position())
+        return line, character
+
+    def _lsp_position_to_cursor_offset(self, editor: CodeEditor, line: int, character: int) -> int:
+        normalized_line = max(0, int(line))
+        normalized_character = max(0, int(character))
+        document = editor.document()
+
+        block = document.findBlockByNumber(normalized_line)
+        if not block.isValid():
+            block = document.lastBlock()
+            if not block.isValid():
+                return 0
+
+        line_text = block.text()
+        clamped_character = min(normalized_character, len(line_text))
+        return block.position() + clamped_character
+
+    def _range_to_cursor(self, editor: CodeEditor, range_payload: dict[str, object]) -> QTextCursor:
+        start_payload = range_payload.get("start")
+        end_payload = range_payload.get("end")
+        if not isinstance(start_payload, dict):
+            return editor.textCursor()
+        if not isinstance(end_payload, dict):
+            end_payload = start_payload
+
+        try:
+            start_line = int(start_payload.get("line", 0))
+            start_character = int(start_payload.get("character", 0))
+            end_line = int(end_payload.get("line", start_line))
+            end_character = int(end_payload.get("character", start_character))
+        except (TypeError, ValueError):
+            return editor.textCursor()
+
+        start_position = self._lsp_position_to_cursor_offset(editor, start_line, start_character)
+        end_position = self._lsp_position_to_cursor_offset(editor, end_line, end_character)
+        if end_position < start_position:
+            start_position, end_position = end_position, start_position
+
+        cursor = QTextCursor(editor.document())
+        cursor.setPosition(start_position)
+        cursor.setPosition(end_position, QTextCursor.MoveMode.KeepAnchor)
+        return cursor
+
+    @staticmethod
+    def _diagnostic_color_for_severity(severity: int) -> QColor:
+        if severity == 1:
+            return QColor("#ff5f56")
+        if severity == 2:
+            return QColor("#f0c674")
+        if severity == 3:
+            return QColor("#6cb6ff")
+        return QColor("#8b949e")
+
+    def _diagnostic_summary_for_editor(self, editor: CodeEditor | None) -> str:
+        if editor is None or not self._should_use_lsp_for_editor(editor):
+            return "idle"
+
+        file_path = self._editor_file_path(editor)
+        if not file_path:
+            return "idle"
+
+        diagnostics = self._lsp_diagnostics_by_path.get(self._normalize_path(file_path), [])
+        if not diagnostics:
+            return "clean"
+
+        errors = 0
+        warnings = 0
+        infos = 0
+        hints = 0
+        for diagnostic in diagnostics:
+            severity_value = diagnostic.get("severity")
+            try:
+                severity = int(severity_value)
+            except (TypeError, ValueError):
+                severity = 2
+            if severity == 1:
+                errors += 1
+            elif severity == 2:
+                warnings += 1
+            elif severity == 3:
+                infos += 1
+            else:
+                hints += 1
+
+        parts: list[str] = []
+        if errors:
+            parts.append(f"{errors}E")
+        if warnings:
+            parts.append(f"{warnings}W")
+        if infos:
+            parts.append(f"{infos}I")
+        if hints:
+            parts.append(f"{hints}H")
+        return " ".join(parts) if parts else "clean"
+
+    def _refresh_lsp_status_label(self) -> None:
+        if not hasattr(self, "lsp_status_label"):
+            return
+
+        if not self._lsp_ready:
+            self.lsp_status_label.setText(f"LSP: {self._lsp_status_message}")
+            self.lsp_status_label.setToolTip(
+                "Python language server status. Install python-lsp-server, pyright-langserver, or jedi-language-server."
+            )
+            return
+
+        summary = self._diagnostic_summary_for_editor(self._current_editor())
+        self.lsp_status_label.setText(f"LSP: {summary}")
+        self.lsp_status_label.setToolTip(self._lsp_status_message)
+
+    def _editor_by_id(self, editor_id: int) -> CodeEditor | None:
+        for editor in self._open_editors():
+            if id(editor) == editor_id:
+                return editor
+        return None
+
+    def trigger_lsp_completion(self) -> None:
+        editor = self._current_editor()
+        if not self._should_use_lsp_for_editor(editor):
+            self.statusBar().showMessage("Completion is available for saved Python files.", 2500)
+            return
+        assert editor is not None
+        if not self._ensure_lsp_ready_for_editor(editor):
+            self.statusBar().showMessage("Python LSP server is unavailable.", 2800)
+            return
+
+        file_path = self._editor_file_path(editor)
+        if not file_path:
+            return
+
+        self._schedule_lsp_document_sync(editor, immediate=True)
+        line, character = self._cursor_to_lsp_position(editor)
+        self._lsp_client.request_completion(
+            file_path,
+            line,
+            character,
+            lambda result, error, editor_id=id(editor): self._show_lsp_completion_menu(editor_id, result, error),
+        )
+
+    def _show_lsp_completion_menu(
+        self,
+        editor_id: int,
+        result: object | None,
+        error: dict[str, object] | None,
+    ) -> None:
+        editor = self._editor_by_id(editor_id)
+        if editor is None:
+            return
+
+        if error is not None:
+            message = error.get("message") if isinstance(error.get("message"), str) else "Completion request failed."
+            self.statusBar().showMessage(message, 3000)
+            self.log(f"[lsp] Completion error: {error}")
+            return
+
+        items: list[dict[str, object]] = []
+        if isinstance(result, list):
+            items = [entry for entry in result if isinstance(entry, dict)]
+        elif isinstance(result, dict):
+            result_items = result.get("items")
+            if isinstance(result_items, list):
+                items = [entry for entry in result_items if isinstance(entry, dict)]
+
+        if not items:
+            self.statusBar().showMessage("No completion items.", 1200)
+            return
+
+        menu = QMenu(editor)
+        added_items = 0
+        for item in items[: self._LSP_MAX_COMPLETION_ITEMS]:
+            label_value = item.get("label")
+            if not isinstance(label_value, str):
+                continue
+            label = label_value.strip()
+            if not label:
+                continue
+
+            detail_value = item.get("detail")
+            detail = detail_value.strip() if isinstance(detail_value, str) else ""
+            action_text = label if not detail else f"{label}    {detail}"
+            action = menu.addAction(action_text)
+            action.triggered.connect(lambda _checked=False, e=editor, completion=item: self._apply_completion_item(e, completion))
+            added_items += 1
+
+        if added_items <= 0:
+            self.statusBar().showMessage("No completion items.", 1200)
+            return
+
+        if len(items) > self._LSP_MAX_COMPLETION_ITEMS:
+            menu.addSeparator()
+            more_action = menu.addAction(f"...and {len(items) - self._LSP_MAX_COMPLETION_ITEMS} more")
+            more_action.setEnabled(False)
+
+        popup_position = editor.viewport().mapToGlobal(editor.cursorRect().bottomLeft())
+        menu.exec(popup_position)
+
+    def _apply_completion_item(self, editor: CodeEditor, item: dict[str, object]) -> None:
+        insert_text = self._completion_insert_text(item)
+        if not insert_text:
+            return
+
+        cursor = editor.textCursor()
+        text_edit_payload = item.get("textEdit")
+        if isinstance(text_edit_payload, dict):
+            if isinstance(text_edit_payload.get("range"), dict):
+                cursor = self._range_to_cursor(editor, text_edit_payload["range"])
+                replacement_value = text_edit_payload.get("newText")
+                if isinstance(replacement_value, str):
+                    insert_text = replacement_value
+            elif isinstance(text_edit_payload.get("replace"), dict):
+                cursor = self._range_to_cursor(editor, text_edit_payload["replace"])
+                replacement_value = text_edit_payload.get("newText")
+                if isinstance(replacement_value, str):
+                    insert_text = replacement_value
+        else:
+            cursor.select(QTextCursor.SelectionType.WordUnderCursor)
+
+        cursor.insertText(insert_text)
+        editor.setTextCursor(cursor)
+        self._schedule_lsp_document_sync(editor)
+
+    def _completion_insert_text(self, item: dict[str, object]) -> str:
+        insert_value = item.get("insertText")
+        if isinstance(insert_value, str) and insert_value:
+            insert_text = insert_value
+        else:
+            label_value = item.get("label")
+            insert_text = label_value if isinstance(label_value, str) else ""
+
+        if item.get("insertTextFormat") == 2:
+            return self._sanitize_snippet_text(insert_text)
+        return insert_text
+
+    @staticmethod
+    def _sanitize_snippet_text(text: str) -> str:
+        cleaned = re.sub(r"\$\{(\d+):([^}]*)\}", r"\2", text)
+        cleaned = re.sub(r"\$\{(\d+)\}", "", cleaned)
+        cleaned = re.sub(r"\$(\d+)", "", cleaned)
+        return cleaned.replace("\\$", "$")
+
+    def go_to_definition(self) -> None:
+        editor = self._current_editor()
+        if not self._should_use_lsp_for_editor(editor):
+            self.statusBar().showMessage("Go-to-definition is available for saved Python files.", 2500)
+            return
+        assert editor is not None
+        if not self._ensure_lsp_ready_for_editor(editor):
+            self.statusBar().showMessage("Python LSP server is unavailable.", 2800)
+            return
+
+        file_path = self._editor_file_path(editor)
+        if not file_path:
+            return
+
+        self._schedule_lsp_document_sync(editor, immediate=True)
+        line, character = self._cursor_to_lsp_position(editor)
+        self._lsp_client.request_definition(
+            file_path,
+            line,
+            character,
+            lambda result, error, editor_id=id(editor): self._handle_go_to_definition_result(editor_id, result, error),
+        )
+
+    def _handle_go_to_definition_result(
+        self,
+        editor_id: int,
+        result: object | None,
+        error: dict[str, object] | None,
+    ) -> None:
+        if self._editor_by_id(editor_id) is None:
+            return
+
+        if error is not None:
+            message = error.get("message") if isinstance(error.get("message"), str) else "Go-to-definition failed."
+            self.statusBar().showMessage(message, 3200)
+            self.log(f"[lsp] Definition error: {error}")
+            return
+
+        location = self._extract_location_from_result(result)
+        if location is None:
+            self.statusBar().showMessage("No definition found.", 1800)
+            return
+
+        uri_value = location.get("uri")
+        if not isinstance(uri_value, str):
+            self.statusBar().showMessage("No definition found.", 1800)
+            return
+
+        target_path = uri_to_path(uri_value)
+        if not target_path:
+            self.statusBar().showMessage("Definition location could not be resolved.", 2500)
+            return
+
+        range_payload = location.get("range")
+        if not isinstance(range_payload, dict):
+            range_payload = {}
+        start_payload = range_payload.get("start")
+        if not isinstance(start_payload, dict):
+            start_payload = {}
+
+        try:
+            line = int(start_payload.get("line", 0))
+        except (TypeError, ValueError):
+            line = 0
+        try:
+            character = int(start_payload.get("character", 0))
+        except (TypeError, ValueError):
+            character = 0
+
+        self._jump_to_file_location(target_path, line, character)
+
+    def _extract_location_from_result(self, result: object | None) -> dict[str, object] | None:
+        if isinstance(result, dict):
+            uri_value = result.get("uri")
+            if isinstance(uri_value, str):
+                range_value = result.get("range")
+                if not isinstance(range_value, dict):
+                    range_value = {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}
+                return {"uri": uri_value, "range": range_value}
+
+            target_uri = result.get("targetUri")
+            if isinstance(target_uri, str):
+                target_range = result.get("targetSelectionRange")
+                if not isinstance(target_range, dict):
+                    target_range = result.get("targetRange")
+                if not isinstance(target_range, dict):
+                    target_range = {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}
+                return {"uri": target_uri, "range": target_range}
+            return None
+
+        if isinstance(result, list):
+            for item in result:
+                resolved = self._extract_location_from_result(item)
+                if resolved is not None:
+                    return resolved
+        return None
+
+    def _jump_to_file_location(self, file_path: str, line: int, character: int) -> None:
+        self.open_file(file_path)
+        key = self._normalize_path(file_path)
+        editor = self._open_editors_by_path.get(key)
+        if editor is None:
+            return
+
+        target_offset = self._lsp_position_to_cursor_offset(editor, line, character)
+        cursor = editor.textCursor()
+        cursor.setPosition(max(0, target_offset))
+        editor.setTextCursor(cursor)
+        editor.centerCursor()
+        editor.setFocus()
+        self.statusBar().showMessage(f"Definition: {file_path}:{line + 1}", 2600)
+
+    def rename_symbol(self) -> None:
+        editor = self._current_editor()
+        if not self._should_use_lsp_for_editor(editor):
+            self.statusBar().showMessage("Rename is available for saved Python files.", 2500)
+            return
+        assert editor is not None
+        if not self._ensure_lsp_ready_for_editor(editor):
+            self.statusBar().showMessage("Python LSP server is unavailable.", 2800)
+            return
+
+        file_path = self._editor_file_path(editor)
+        if not file_path:
+            return
+
+        cursor = editor.textCursor()
+        current_symbol = cursor.selectedText().replace("\u2029", "\n").strip()
+        if not current_symbol:
+            cursor.select(QTextCursor.SelectionType.WordUnderCursor)
+            current_symbol = cursor.selectedText().replace("\u2029", "\n").strip()
+
+        new_name, ok = QInputDialog.getText(self, "Rename Symbol", "New name:", text=current_symbol)
+        if not ok:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            return
+
+        self._schedule_lsp_document_sync(editor, immediate=True)
+        line, character = self._cursor_to_lsp_position(editor)
+        self._lsp_client.request_rename(
+            file_path,
+            line,
+            character,
+            new_name,
+            self._apply_rename_result,
+        )
+
+    def _apply_rename_result(self, result: object | None, error: dict[str, object] | None) -> None:
+        if error is not None:
+            message = error.get("message") if isinstance(error.get("message"), str) else "Rename request failed."
+            self.statusBar().showMessage(message, 3200)
+            self.log(f"[lsp] Rename error: {error}")
+            return
+
+        if not isinstance(result, dict):
+            self.statusBar().showMessage("No rename changes were produced.", 2200)
+            return
+
+        changed_files, changed_edits = self._apply_workspace_edit(result)
+        if changed_files <= 0:
+            self.statusBar().showMessage("No rename edits to apply.", 2200)
+            return
+
+        self.statusBar().showMessage(
+            f"Rename applied: {changed_edits} edit(s) across {changed_files} file(s).",
+            3200,
+        )
+        self.log(f"[lsp] Rename applied: {changed_edits} edit(s) across {changed_files} file(s).")
+
+    def _apply_workspace_edit(self, workspace_edit: dict[str, object]) -> tuple[int, int]:
+        collected_changes = self._collect_workspace_edit_changes(workspace_edit)
+        if not collected_changes:
+            return 0, 0
+
+        changed_files = 0
+        changed_edits = 0
+        for file_path, edits in collected_changes.items():
+            if not edits:
+                continue
+
+            key = self._normalize_path(file_path)
+            open_editor = self._open_editors_by_path.get(key)
+            if open_editor is not None:
+                applied = self._apply_text_edits_to_editor(open_editor, edits)
+            else:
+                applied = self._apply_text_edits_to_file(file_path, edits)
+
+            if applied > 0:
+                changed_files += 1
+                changed_edits += applied
+                self._record_file_disk_state(file_path)
+
+        if changed_files > 0:
+            self._sync_file_watcher_paths()
+        return changed_files, changed_edits
+
+    def _collect_workspace_edit_changes(self, workspace_edit: dict[str, object]) -> dict[str, list[dict[str, object]]]:
+        collected: dict[str, list[dict[str, object]]] = {}
+
+        changes_payload = workspace_edit.get("changes")
+        if isinstance(changes_payload, dict):
+            for uri, edits_payload in changes_payload.items():
+                if not isinstance(uri, str) or not isinstance(edits_payload, list):
+                    continue
+                resolved_path = uri_to_path(uri)
+                if not resolved_path:
+                    continue
+                valid_edits = [entry for entry in edits_payload if isinstance(entry, dict)]
+                if not valid_edits:
+                    continue
+                collected.setdefault(os.path.abspath(resolved_path), []).extend(valid_edits)
+
+        document_changes = workspace_edit.get("documentChanges")
+        if isinstance(document_changes, list):
+            for change in document_changes:
+                if not isinstance(change, dict):
+                    continue
+                text_document = change.get("textDocument")
+                edits_payload = change.get("edits")
+                if not isinstance(text_document, dict) or not isinstance(edits_payload, list):
+                    continue
+                uri_value = text_document.get("uri")
+                if not isinstance(uri_value, str):
+                    continue
+                resolved_path = uri_to_path(uri_value)
+                if not resolved_path:
+                    continue
+                valid_edits = [entry for entry in edits_payload if isinstance(entry, dict)]
+                if not valid_edits:
+                    continue
+                collected.setdefault(os.path.abspath(resolved_path), []).extend(valid_edits)
+
+        return collected
+
+    @staticmethod
+    def _sort_text_edits_descending(edits: list[dict[str, object]]) -> list[dict[str, object]]:
+        def sort_key(edit: dict[str, object]) -> tuple[int, int]:
+            range_payload = edit.get("range")
+            if not isinstance(range_payload, dict):
+                return (0, 0)
+            start_payload = range_payload.get("start")
+            if not isinstance(start_payload, dict):
+                return (0, 0)
+            try:
+                line = int(start_payload.get("line", 0))
+            except (TypeError, ValueError):
+                line = 0
+            try:
+                character = int(start_payload.get("character", 0))
+            except (TypeError, ValueError):
+                character = 0
+            return (line, character)
+
+        return sorted(edits, key=sort_key, reverse=True)
+
+    def _apply_text_edits_to_editor(self, editor: CodeEditor, edits: list[dict[str, object]]) -> int:
+        sorted_edits = self._sort_text_edits_descending(edits)
+        if not sorted_edits:
+            return 0
+
+        block_cursor = QTextCursor(editor.document())
+        block_cursor.beginEditBlock()
+        applied_count = 0
+        try:
+            for edit in sorted_edits:
+                range_payload = edit.get("range")
+                if not isinstance(range_payload, dict):
+                    continue
+                start_payload = range_payload.get("start")
+                end_payload = range_payload.get("end")
+                if not isinstance(start_payload, dict) or not isinstance(end_payload, dict):
+                    continue
+
+                try:
+                    start_line = int(start_payload.get("line", 0))
+                    start_character = int(start_payload.get("character", 0))
+                    end_line = int(end_payload.get("line", start_line))
+                    end_character = int(end_payload.get("character", start_character))
+                except (TypeError, ValueError):
+                    continue
+
+                start_position = self._lsp_position_to_cursor_offset(editor, start_line, start_character)
+                end_position = self._lsp_position_to_cursor_offset(editor, end_line, end_character)
+                if end_position < start_position:
+                    start_position, end_position = end_position, start_position
+
+                replacement_value = edit.get("newText")
+                replacement_text = replacement_value if isinstance(replacement_value, str) else ""
+
+                replacement_cursor = QTextCursor(editor.document())
+                replacement_cursor.setPosition(start_position)
+                replacement_cursor.setPosition(end_position, QTextCursor.MoveMode.KeepAnchor)
+                replacement_cursor.insertText(replacement_text)
+                applied_count += 1
+        finally:
+            block_cursor.endEditBlock()
+
+        if applied_count > 0:
+            self._update_editor_tab_title(editor)
+            self._schedule_lsp_document_sync(editor, immediate=True)
+        return applied_count
+
+    def _apply_text_edits_to_file(self, file_path: str, edits: list[dict[str, object]]) -> int:
+        if not os.path.isfile(file_path):
+            return 0
+
+        try:
+            content = self._read_text_file(file_path)
+        except OSError as exc:
+            self.log(f"[lsp] Could not read rename target {file_path}: {exc}")
+            return 0
+
+        sorted_edits = self._sort_text_edits_descending(edits)
+        if not sorted_edits:
+            return 0
+
+        applied_count = 0
+        for edit in sorted_edits:
+            range_payload = edit.get("range")
+            if not isinstance(range_payload, dict):
+                continue
+            start_payload = range_payload.get("start")
+            end_payload = range_payload.get("end")
+            if not isinstance(start_payload, dict) or not isinstance(end_payload, dict):
+                continue
+
+            try:
+                start_line = int(start_payload.get("line", 0))
+                start_character = int(start_payload.get("character", 0))
+                end_line = int(end_payload.get("line", start_line))
+                end_character = int(end_payload.get("character", start_character))
+            except (TypeError, ValueError):
+                continue
+
+            start_position = self._text_position_from_lsp(content, start_line, start_character)
+            end_position = self._text_position_from_lsp(content, end_line, end_character)
+            if end_position < start_position:
+                start_position, end_position = end_position, start_position
+
+            replacement_value = edit.get("newText")
+            replacement_text = replacement_value if isinstance(replacement_value, str) else ""
+            content = content[:start_position] + replacement_text + content[end_position:]
+            applied_count += 1
+
+        if applied_count <= 0:
+            return 0
+
+        try:
+            with open(file_path, "w", encoding="utf-8", newline="") as handle:
+                handle.write(content)
+        except OSError as exc:
+            self.log(f"[lsp] Could not write rename target {file_path}: {exc}")
+            return 0
+
+        self.log(f"[lsp] Updated file from rename: {file_path}")
+        return applied_count
+
+    @staticmethod
+    def _text_position_from_lsp(content: str, line: int, character: int) -> int:
+        normalized_line = max(0, int(line))
+        normalized_character = max(0, int(character))
+
+        lines = content.splitlines(keepends=True)
+        if not lines:
+            return 0
+        if normalized_line >= len(lines):
+            return len(content)
+
+        offset = 0
+        for index in range(normalized_line):
+            offset += len(lines[index])
+
+        line_text = lines[normalized_line]
+        line_without_newline = line_text.rstrip("\r\n")
+        offset += min(normalized_character, len(line_without_newline))
+        return offset
 
     def open_settings_dialog(self) -> None:
         dialog = QDialog(self)
@@ -1543,6 +2559,7 @@ class MainWindow(QMainWindow):
             "ui": {
                 "theme": self._DEFAULT_THEME_ID,
                 "zoom_percent": self._DEFAULT_UI_ZOOM_PERCENT,
+                "code_zoom_point_size": None,
                 "bottom_panel_layout": self._BOTTOM_LAYOUT_STACKED,
                 "output_enabled": True,
                 "terminal_enabled": True,
@@ -1644,6 +2661,29 @@ class MainWindow(QMainWindow):
         clamped_zoom = max(self._MIN_UI_ZOOM_PERCENT, min(self._MAX_UI_ZOOM_PERCENT, parsed_zoom))
         if clamped_zoom != parsed_zoom:
             self.log("[settings] ui.zoom_percent out of bounds; clamped to supported range.")
+        return clamped_zoom
+
+    def _parse_code_zoom_setting(self, payload: object) -> float | None:
+        if not isinstance(payload, dict):
+            return None
+
+        ui_payload = payload.get("ui")
+        if not isinstance(ui_payload, dict):
+            return None
+
+        zoom_value = ui_payload.get("code_zoom_point_size")
+        if zoom_value is None:
+            return None
+
+        try:
+            parsed_zoom = float(zoom_value)
+        except (TypeError, ValueError):
+            self.log("[settings] Invalid ui.code_zoom_point_size; using default editor zoom.")
+            return None
+
+        clamped_zoom = self._clamp_code_zoom_point_size(parsed_zoom)
+        if abs(clamped_zoom - parsed_zoom) >= 1e-6:
+            self.log("[settings] ui.code_zoom_point_size out of bounds; clamped to supported range.")
         return clamped_zoom
 
     def _parse_bottom_panel_visibility_settings(self, payload: object) -> tuple[bool, bool]:
@@ -1755,6 +2795,7 @@ class MainWindow(QMainWindow):
             ui_payload = {}
         ui_payload["theme"] = self._theme_id
         ui_payload["zoom_percent"] = self._ui_zoom_percent
+        ui_payload["code_zoom_point_size"] = self._code_zoom_point_size
         payload["ui"] = ui_payload
 
         try:
@@ -1791,6 +2832,7 @@ class MainWindow(QMainWindow):
             ui_payload = {}
         ui_payload["theme"] = self._theme_id
         ui_payload["zoom_percent"] = self._ui_zoom_percent
+        ui_payload["code_zoom_point_size"] = self._code_zoom_point_size
         ui_payload["bottom_panel_layout"] = self._bottom_layout_mode
         ui_payload["output_enabled"] = self.output_dock.isVisible()
         ui_payload["terminal_enabled"] = self.terminal_dock.isVisible()
@@ -1834,7 +2876,9 @@ class MainWindow(QMainWindow):
 
         self._autosave_enabled, self._autosave_interval_seconds = self._parse_autosave_settings(payload)
         self._ui_zoom_percent = self._parse_ui_zoom_setting(payload)
+        self._code_zoom_point_size = self._parse_code_zoom_setting(payload)
         self._apply_theme(self._parse_theme_setting(payload))
+        self._apply_code_zoom_to_open_editors()
         self._update_ui_zoom_actions()
         if not self._startup_window_mode_loaded:
             saved_window_size = self._parse_window_size_setting(payload)
@@ -2094,13 +3138,17 @@ class MainWindow(QMainWindow):
         ]
 
         desired_files: dict[str, str] = {}
-        for editor in self._open_editors():
-            file_path = self._editor_file_path(editor)
-            if not file_path:
-                continue
-            absolute_path = os.path.abspath(file_path)
-            if os.path.isfile(absolute_path):
-                desired_files[self._normalize_path(absolute_path)] = absolute_path
+        for tabs in self._all_tab_widgets():
+            for index in range(tabs.count()):
+                widget = self._tab_widget_at(tabs, index)
+                if widget is None:
+                    continue
+                file_path = self._widget_file_path(widget)
+                if not file_path:
+                    continue
+                absolute_path = os.path.abspath(file_path)
+                if os.path.isfile(absolute_path):
+                    desired_files[self._normalize_path(absolute_path)] = absolute_path
 
         current_files = {
             self._normalize_path(path): path
@@ -2146,21 +3194,27 @@ class MainWindow(QMainWindow):
         self._sync_file_watcher_paths()
 
     def _poll_watched_files(self) -> None:
-        if not self._open_editors_by_path:
+        if not self._open_editors_by_path and not self._open_image_tabs_by_path:
             self._prune_recent_internal_writes()
             return
 
-        for editor in self._open_editors():
-            file_path = self._editor_file_path(editor)
-            if not file_path:
-                continue
-            self._handle_external_file_change(file_path, source="poll")
+        for tabs in self._all_tab_widgets():
+            for index in range(tabs.count()):
+                widget = self._tab_widget_at(tabs, index)
+                if widget is None:
+                    continue
+                file_path = self._widget_file_path(widget)
+                if not file_path:
+                    continue
+                self._handle_external_file_change(file_path, source="poll")
 
     def _handle_external_file_change(self, file_path: str, source: str) -> None:
         absolute_path = os.path.abspath(file_path)
         key = self._normalize_path(absolute_path)
-        editor = self._open_editors_by_path.get(key)
-        if editor is None:
+        widget: QWidget | None = self._open_editors_by_path.get(key)
+        if widget is None:
+            widget = self._open_image_tabs_by_path.get(key)
+        if widget is None:
             return
 
         if self._is_recent_internal_write(absolute_path):
@@ -2180,7 +3234,15 @@ class MainWindow(QMainWindow):
             self.log(f"[watcher] File missing on disk: {absolute_path}")
             return
 
+        if isinstance(widget, ImageViewer):
+            self._reload_image_viewer_from_disk(widget, reason="external change")
+            return
+
         if key in self._external_change_prompts:
+            return
+
+        editor = widget if isinstance(widget, CodeEditor) else None
+        if editor is None:
             return
 
         if editor.document().isModified():
@@ -2210,6 +3272,26 @@ class MainWindow(QMainWindow):
 
         self._reload_editor_from_disk(editor, reason="external change")
 
+    def _reload_image_viewer_from_disk(self, viewer: ImageViewer, reason: str) -> bool:
+        file_path = self._widget_file_path(viewer)
+        if not file_path:
+            return False
+
+        absolute_path = os.path.abspath(file_path)
+        if not viewer.reload_image():
+            self.statusBar().showMessage(f"Could not reload image: {absolute_path}", 2500)
+            self.log(f"[watcher] Failed to reload image: {absolute_path}")
+            return False
+
+        if viewer is self._current_tab_widget():
+            self._update_editor_mode_status(viewer)
+            self._refresh_breadcrumbs(viewer)
+
+        self._record_file_disk_state(absolute_path)
+        self.statusBar().showMessage(f"Reloaded {absolute_path} ({reason}).", 2500)
+        self.log(f"[watcher] Reloaded image from disk: {absolute_path} ({reason}).")
+        return True
+
     def _reload_editor_from_disk(self, editor: CodeEditor, reason: str) -> bool:
         file_path = self._editor_file_path(editor)
         if not file_path:
@@ -2232,6 +3314,7 @@ class MainWindow(QMainWindow):
         editor.setProperty("large_file_mode", large_file_mode)
         editor.setProperty("large_file_mode_reason", large_file_reason)
         editor.configure_syntax_highlighting(absolute_path, large_file_mode)
+        self._schedule_lsp_document_sync(editor, immediate=True)
 
         max_position = max(0, editor.document().characterCount() - 1)
         cursor = editor.textCursor()
@@ -2243,6 +3326,7 @@ class MainWindow(QMainWindow):
         if editor is self._current_editor():
             self._update_editor_mode_status(editor)
             self._refresh_breadcrumbs(editor)
+            self._apply_lsp_diagnostics_to_editor(editor)
             if self.find_panel.isVisible():
                 self._refresh_find_highlights()
 
@@ -2252,33 +3336,38 @@ class MainWindow(QMainWindow):
         return True
 
     def _request_close_tab(self, tabs: QTabWidget, tab_index: int) -> None:
-        editor = self._editor_at(tabs, tab_index)
-        if editor is None:
+        widget = self._tab_widget_at(tabs, tab_index)
+        if widget is None:
             return
 
         self._set_active_tab_widget(tabs)
-        if not self._confirm_close_editor(editor):
+        if not self._confirm_close_editor(widget):
             return
 
         self._close_editor_tab(tabs, tab_index)
 
     def _close_editor_tab(self, tabs: QTabWidget, tab_index: int) -> None:
-        editor = self._editor_at(tabs, tab_index)
-        if editor is None:
+        widget = self._tab_widget_at(tabs, tab_index)
+        if widget is None:
             return
 
-        file_path = self._editor_file_path(editor)
+        editor = widget if isinstance(widget, CodeEditor) else None
+        if editor is not None:
+            self._close_lsp_document(editor)
+
+        file_path = self._widget_file_path(widget)
         if file_path:
             key = self._normalize_path(file_path)
             self._open_editors_by_path.pop(key, None)
+            self._open_image_tabs_by_path.pop(key, None)
             self._file_disk_state.pop(key, None)
             self._recent_internal_writes.pop(key, None)
 
-        if self._find_highlight_editor is editor:
+        if editor is not None and self._find_highlight_editor is editor:
             self._find_highlight_editor = None
 
         tabs.removeTab(tab_index)
-        editor.deleteLater()
+        widget.deleteLater()
         self._sync_file_watcher_paths()
         self._update_editor_surface()
         self._refresh_welcome_recent_list()
@@ -2286,7 +3375,11 @@ class MainWindow(QMainWindow):
         if tabs.count() == 0 and self._active_editor_tabs is tabs:
             self._active_editor_tabs = self.primary_tabs if tabs is self.secondary_tabs else tabs
 
-    def _confirm_close_editor(self, editor: CodeEditor) -> bool:
+    def _confirm_close_editor(self, widget: QWidget) -> bool:
+        editor = widget if isinstance(widget, CodeEditor) else None
+        if editor is None:
+            return True
+
         if not editor.document().isModified():
             return True
 
@@ -2317,8 +3410,8 @@ class MainWindow(QMainWindow):
             return
 
         while self.secondary_tabs.count() > 0:
-            editor = self._editor_at(self.secondary_tabs, 0)
-            if editor is None:
+            widget = self._tab_widget_at(self.secondary_tabs, 0)
+            if widget is None:
                 self.secondary_tabs.removeTab(0)
                 continue
 
@@ -2326,7 +3419,7 @@ class MainWindow(QMainWindow):
             tooltip = self.secondary_tabs.tabToolTip(0)
             self.secondary_tabs.removeTab(0)
 
-            new_index = self._add_editor_tab(self.primary_tabs, editor, title)
+            new_index = self._add_editor_tab(self.primary_tabs, widget, title)
             self.primary_tabs.setTabToolTip(new_index, tooltip)
 
         self.secondary_tabs.hide()
@@ -2336,15 +3429,15 @@ class MainWindow(QMainWindow):
 
     def move_current_tab_to_other_split(self) -> None:
         current_tabs = self._active_editor_tabs or self.primary_tabs
-        editor = self._current_editor(current_tabs)
-        if editor is None:
+        widget = self._current_tab_widget(current_tabs)
+        if widget is None:
             return
 
         if not self.secondary_tabs.isVisible():
             self.split_toggle_action.setChecked(True)
 
         target_tabs = self.secondary_tabs if current_tabs is self.primary_tabs else self.primary_tabs
-        tab_index = current_tabs.indexOf(editor)
+        tab_index = current_tabs.indexOf(widget)
         if tab_index < 0:
             return
 
@@ -2352,12 +3445,12 @@ class MainWindow(QMainWindow):
         tooltip = current_tabs.tabToolTip(tab_index)
         current_tabs.removeTab(tab_index)
 
-        new_index = self._add_editor_tab(target_tabs, editor, title)
+        new_index = self._add_editor_tab(target_tabs, widget, title)
         target_tabs.setTabToolTip(new_index, tooltip)
         target_tabs.setCurrentIndex(new_index)
         self._set_active_tab_widget(target_tabs)
-        editor.setFocus()
-        self._refresh_breadcrumbs(editor)
+        widget.setFocus()
+        self._refresh_breadcrumbs(widget)
         self.log(f"[editor] Moved tab to {'secondary' if target_tabs is self.secondary_tabs else 'primary'} split")
 
     def _on_current_tab_changed(self, tabs: QTabWidget, tab_index: int) -> None:
@@ -2370,8 +3463,8 @@ class MainWindow(QMainWindow):
             return
 
         self._set_active_tab_widget(tabs)
-        editor = self._editor_at(tabs, tab_index)
-        if editor is None:
+        widget = self._tab_widget_at(tabs, tab_index)
+        if widget is None:
             self._update_editor_surface()
             self._update_editor_mode_status(None)
             self._refresh_breadcrumbs(None)
@@ -2379,18 +3472,24 @@ class MainWindow(QMainWindow):
                 self._refresh_find_highlights()
             return
 
-        file_path = self._editor_file_path(editor)
+        file_path = self._widget_file_path(widget)
         if file_path:
             self._reveal_path(file_path)
-        self._update_editor_mode_status(editor)
-        self._refresh_breadcrumbs(editor)
+        self._update_editor_mode_status(widget)
+        self._refresh_breadcrumbs(widget)
+
+        editor = widget if isinstance(widget, CodeEditor) else None
+        if editor is not None:
+            self._apply_lsp_diagnostics_to_editor(editor)
+
         self._update_editor_surface()
         if self.find_panel.isVisible():
             self._refresh_find_highlights()
 
     def _set_active_tab_widget(self, tabs: QTabWidget) -> None:
         self._active_editor_tabs = tabs
-        self._refresh_breadcrumbs(self._current_editor(tabs))
+        self._refresh_breadcrumbs(self._current_tab_widget(tabs))
+        self._refresh_lsp_status_label()
 
     def _reveal_path(self, file_path: str) -> None:
         index = self.fs_model.index(file_path)
@@ -2405,122 +3504,170 @@ class MainWindow(QMainWindow):
         self.file_tree.setCurrentIndex(index)
         self.file_tree.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
 
-    def _update_editor_tab_title(self, editor: CodeEditor) -> None:
-        tabs = self._find_tab_widget_for_editor(editor)
+    def _update_editor_tab_title(self, widget: QWidget) -> None:
+        tabs = self._find_tab_widget_for_editor(widget)
         if tabs is None:
             return
 
-        tab_index = tabs.indexOf(editor)
+        tab_index = tabs.indexOf(widget)
         if tab_index < 0:
             return
 
-        display_name = self._editor_display_name(editor)
-        dirty_prefix = "*" if editor.document().isModified() else ""
+        display_name = self._widget_display_name(widget)
+        dirty_prefix = "*" if isinstance(widget, CodeEditor) and widget.document().isModified() else ""
         tabs.setTabText(tab_index, f"{dirty_prefix}{display_name}")
 
-        file_path = self._editor_file_path(editor)
+        file_path = self._widget_file_path(widget)
         tabs.setTabToolTip(tab_index, file_path or display_name)
 
     def _update_open_tabs_after_rename(self, old_path: str, new_path: str) -> None:
         old_key = self._normalize_path(old_path)
-        direct_editor = self._open_editors_by_path.pop(old_key, None)
-        if direct_editor is not None:
-            self._apply_new_editor_path(direct_editor, new_path)
+        direct_widget: QWidget | None = self._open_editors_by_path.pop(old_key, None)
+        if direct_widget is None:
+            direct_widget = self._open_image_tabs_by_path.pop(old_key, None)
+        if direct_widget is not None:
+            self._apply_new_editor_path(direct_widget, new_path)
             return
 
-        moved_editors: list[tuple[CodeEditor, str]] = []
-        for editor in self._open_editors_by_path.values():
-            file_path_value = self._editor_file_path(editor)
+        moved_widgets: list[tuple[QWidget, str]] = []
+        open_widgets: list[QWidget] = list(self._open_editors_by_path.values()) + list(self._open_image_tabs_by_path.values())
+        for widget in open_widgets:
+            file_path_value = self._widget_file_path(widget)
             if file_path_value and self._is_same_or_child(file_path_value, old_path):
                 relative = os.path.relpath(file_path_value, old_path)
-                moved_editors.append((editor, os.path.join(new_path, relative)))
+                moved_widgets.append((widget, os.path.join(new_path, relative)))
 
-        for editor, updated_path in moved_editors:
-            old_editor_path = self._editor_file_path(editor)
-            if old_editor_path:
-                self._open_editors_by_path.pop(self._normalize_path(old_editor_path), None)
-            self._apply_new_editor_path(editor, updated_path)
+        for widget, updated_path in moved_widgets:
+            old_widget_path = self._widget_file_path(widget)
+            if old_widget_path:
+                old_key_for_widget = self._normalize_path(old_widget_path)
+                self._open_editors_by_path.pop(old_key_for_widget, None)
+                self._open_image_tabs_by_path.pop(old_key_for_widget, None)
+            self._apply_new_editor_path(widget, updated_path)
 
-    def _apply_new_editor_path(self, editor: CodeEditor, new_path: str) -> None:
-        old_path = self._editor_file_path(editor)
+    def _apply_new_editor_path(self, widget: QWidget, new_path: str) -> None:
+        old_path = self._widget_file_path(widget)
         absolute_path = os.path.abspath(new_path)
-        editor.setProperty("file_path", absolute_path)
-        large_file_mode = bool(editor.property("large_file_mode"))
-        editor.configure_syntax_highlighting(absolute_path, large_file_mode)
+
+        editor = widget if isinstance(widget, CodeEditor) else None
+        viewer = widget if isinstance(widget, ImageViewer) else None
+
+        if editor is not None and old_path and not self._paths_equal(old_path, absolute_path):
+            self._lsp_client.close_document(old_path)
+            self._clear_lsp_diagnostics_for_path(old_path)
+
+        if editor is not None:
+            editor.setProperty("file_path", absolute_path)
+            large_file_mode = bool(editor.property("large_file_mode"))
+            editor.configure_syntax_highlighting(absolute_path, large_file_mode)
+
+        if viewer is not None:
+            viewer.setProperty("file_path", absolute_path)
+            viewer.set_image_path(absolute_path)
+
         if old_path:
             old_key = self._normalize_path(old_path)
             self._file_disk_state.pop(old_key, None)
             self._recent_internal_writes.pop(old_key, None)
 
         new_key = self._normalize_path(absolute_path)
-        self._open_editors_by_path[new_key] = editor
+        if editor is not None:
+            self._open_editors_by_path[new_key] = editor
+        if viewer is not None:
+            self._open_image_tabs_by_path[new_key] = viewer
+
         self._record_file_disk_state(absolute_path)
         self._sync_file_watcher_paths()
-        self._update_editor_tab_title(editor)
-        if editor is self._current_editor():
-            self._update_editor_mode_status(editor)
-            self._refresh_breadcrumbs(editor)
+        self._update_editor_tab_title(widget)
+
+        if editor is not None:
+            self._schedule_lsp_document_sync(editor, immediate=True)
+            self._apply_lsp_diagnostics_to_editor(editor)
+
+        if widget is self._current_tab_widget():
+            self._update_editor_mode_status(widget)
+            self._refresh_breadcrumbs(widget)
 
     def _close_tabs_for_deleted_path(self, deleted_path: str) -> None:
         for tabs in self._all_tab_widgets():
             for index in reversed(range(tabs.count())):
-                editor = self._editor_at(tabs, index)
-                if editor is None:
+                widget = self._tab_widget_at(tabs, index)
+                if widget is None:
                     continue
-                file_path = self._editor_file_path(editor)
+                file_path = self._widget_file_path(widget)
                 if file_path and self._is_same_or_child(file_path, deleted_path):
                     self._close_editor_tab(tabs, index)
 
-    def _find_tab_widget_for_editor(self, editor: CodeEditor) -> QTabWidget | None:
+    def _find_tab_widget_for_editor(self, widget: QWidget) -> QTabWidget | None:
         for tabs in self._all_tab_widgets():
-            if tabs.indexOf(editor) >= 0:
+            if tabs.indexOf(widget) >= 0:
                 return tabs
         return None
 
     def _all_tab_widgets(self) -> tuple[QTabWidget, QTabWidget]:
         return self.primary_tabs, self.secondary_tabs
 
-    def _editor_at(self, tabs: QTabWidget, tab_index: int) -> CodeEditor | None:
+    def _tab_widget_at(self, tabs: QTabWidget, tab_index: int) -> QWidget | None:
         widget = tabs.widget(tab_index)
+        if isinstance(widget, QWidget):
+            return widget
+        return None
+
+    def _editor_at(self, tabs: QTabWidget, tab_index: int) -> CodeEditor | None:
+        widget = self._tab_widget_at(tabs, tab_index)
         if isinstance(widget, CodeEditor):
             return widget
         return None
 
-    def _current_editor(self, tabs: QTabWidget | None = None) -> CodeEditor | None:
+    def _current_tab_widget(self, tabs: QTabWidget | None = None) -> QWidget | None:
         active_tabs = tabs or self._active_editor_tabs or self.primary_tabs
-        editor = self._editor_at(active_tabs, active_tabs.currentIndex())
-        if editor is not None:
-            return editor
+        widget = self._tab_widget_at(active_tabs, active_tabs.currentIndex())
+        if widget is not None:
+            return widget
 
         for tab_widget in self._all_tab_widgets():
-            editor = self._editor_at(tab_widget, tab_widget.currentIndex())
-            if editor is not None:
-                return editor
+            if tab_widget is active_tabs:
+                continue
+            fallback_widget = self._tab_widget_at(tab_widget, tab_widget.currentIndex())
+            if fallback_widget is not None:
+                return fallback_widget
         return None
 
-    def _editor_file_path(self, editor: CodeEditor) -> str | None:
-        value = editor.property("file_path")
+    def _current_editor(self, tabs: QTabWidget | None = None) -> CodeEditor | None:
+        widget = self._current_tab_widget(tabs)
+        if isinstance(widget, CodeEditor):
+            return widget
+        return None
+
+    def _widget_file_path(self, widget: QWidget) -> str | None:
+        value = widget.property("file_path")
         if isinstance(value, str) and value:
             return value
         return None
 
-    def _editor_display_name(self, editor: CodeEditor) -> str:
-        file_path = self._editor_file_path(editor)
+    def _widget_display_name(self, widget: QWidget) -> str:
+        file_path = self._widget_file_path(widget)
         if file_path:
             return os.path.basename(file_path)
 
-        display_name = editor.property("display_name")
+        display_name = widget.property("display_name")
         if isinstance(display_name, str) and display_name:
             return display_name
         return "Untitled"
 
+    def _editor_file_path(self, editor: CodeEditor) -> str | None:
+        return self._widget_file_path(editor)
+
+    def _editor_display_name(self, editor: CodeEditor) -> str:
+        return self._widget_display_name(editor)
+
     def _close_all_open_editors(self) -> bool:
         for tabs in self._all_tab_widgets():
             for index in reversed(range(tabs.count())):
-                editor = self._editor_at(tabs, index)
-                if editor is None:
+                widget = self._tab_widget_at(tabs, index)
+                if widget is None:
                     continue
-                if not self._confirm_close_editor(editor):
+                if not self._confirm_close_editor(widget):
                     return False
                 self._close_editor_tab(tabs, index)
         return True
@@ -2544,6 +3691,7 @@ class MainWindow(QMainWindow):
             return
 
         self._persist_ui_settings()
+        self._lsp_client.stop()
         event.accept()
 
     @staticmethod

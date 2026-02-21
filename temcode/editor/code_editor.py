@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, QSize, Qt, QTimer
+from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFontMetrics, QKeyEvent, QMouseEvent, QPainter, QTextCursor, QTextFormat, QWheelEvent
 from PySide6.QtWidgets import QPlainTextEdit, QTextEdit, QWidget
 
@@ -57,6 +57,7 @@ class MinimapArea(QWidget):
 
 
 class CodeEditor(QPlainTextEdit):
+    code_zoom_changed = Signal(float)
     _OPENING_TO_CLOSING = {"(": ")", "[": "]", "{": "}"}
     _CLOSING_TO_OPENING = {")": "(", "]": "[", "}": "{"}
     _MIN_ZOOM_POINT_SIZE = 8.0
@@ -84,6 +85,7 @@ class CodeEditor(QPlainTextEdit):
         self._minimap_normal_refresh_ms = 120
         self._minimap_large_refresh_ms = 900
         self._syntax_highlighter = None
+        self._syntax_file_path: str | None = None
         self._language_id = LanguageId.PLAIN_TEXT
         self._language_display_name = LANGUAGE_DISPLAY_NAMES[LanguageId.PLAIN_TEXT]
         self._large_file_mode = False
@@ -92,6 +94,7 @@ class CodeEditor(QPlainTextEdit):
         self._line_number_area = LineNumberArea(self)
         self._minimap_area = MinimapArea(self)
         self._internal_extra_selections: list[QTextEdit.ExtraSelection] = []
+        self._diagnostic_extra_selections: list[QTextEdit.ExtraSelection] = []
         self._external_extra_selections: list[QTextEdit.ExtraSelection] = []
         self._minimap_refresh_timer = QTimer(self)
         self._minimap_refresh_timer.setSingleShot(True)
@@ -115,7 +118,13 @@ class CodeEditor(QPlainTextEdit):
         self._rebuild_minimap_density()
 
     def configure_syntax_highlighting(self, file_path: str | None, large_file_mode: bool) -> None:
-        self._syntax_highlighter = build_highlighter(self.document(), file_path, large_file_mode)
+        self._syntax_file_path = file_path
+        self._syntax_highlighter = build_highlighter(
+            self.document(),
+            file_path,
+            large_file_mode,
+            theme_id=self._theme_id,
+        )
         self._large_file_mode = large_file_mode
         if self._syntax_highlighter is None:
             self._language_id = LanguageId.PLAIN_TEXT
@@ -138,6 +147,7 @@ class CodeEditor(QPlainTextEdit):
         if normalized_theme == self._theme_id:
             return
         self._theme_id = normalized_theme
+        self.configure_syntax_highlighting(self._syntax_file_path, self._large_file_mode)
         self._refresh_internal_highlights()
         self._line_number_area.update()
 
@@ -224,6 +234,10 @@ class CodeEditor(QPlainTextEdit):
 
     def set_external_extra_selections(self, selections: list[QTextEdit.ExtraSelection]) -> None:
         self._external_extra_selections = list(selections)
+        self._apply_extra_selections()
+
+    def set_diagnostic_extra_selections(self, selections: list[QTextEdit.ExtraSelection]) -> None:
+        self._diagnostic_extra_selections = list(selections)
         self._apply_extra_selections()
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
@@ -359,7 +373,8 @@ class CodeEditor(QPlainTextEdit):
         self._line_number_area.update()
 
     def _apply_extra_selections(self) -> None:
-        super().setExtraSelections(self._internal_extra_selections + self._external_extra_selections)
+        selections = self._internal_extra_selections + self._diagnostic_extra_selections + self._external_extra_selections
+        super().setExtraSelections(selections)
 
     def _add_current_line_highlight(self) -> None:
         colors = self._active_theme_colors()
@@ -551,27 +566,37 @@ class CodeEditor(QPlainTextEdit):
 
         cursor.insertText("\n" + base_indent + extra_indent)
 
+    def code_zoom_point_size(self) -> float:
+        font = self.font()
+        size = font.pointSizeF()
+        if size <= 0:
+            fallback_size = font.pointSize()
+            size = float(fallback_size if fallback_size > 0 else 10.0)
+        return size
+
+    def set_code_zoom_point_size(self, point_size: float, emit_signal: bool = True) -> float:
+        clamped = max(self._MIN_ZOOM_POINT_SIZE, min(self._MAX_ZOOM_POINT_SIZE, float(point_size)))
+        current_size = self.code_zoom_point_size()
+        if abs(clamped - current_size) < 1e-6:
+            return current_size
+
+        # Keep a per-editor font-size rule so app-level stylesheets do not reset code zoom.
+        self.setStyleSheet(f"font-size: {clamped:g}pt;")
+        font = self.font()
+        font.setPointSizeF(clamped)
+        self.setFont(font)
+        self._line_number_area.setFont(font)
+        self._sync_font_dependent_metrics()
+        if emit_signal:
+            self.code_zoom_changed.emit(clamped)
+        return clamped
+
     def _adjust_zoom(self, step_direction: int) -> None:
         if step_direction == 0:
             return
 
-        font = self.font()
-        current_size = font.pointSizeF()
-        if current_size <= 0:
-            fallback_size = font.pointSize()
-            current_size = float(fallback_size if fallback_size > 0 else 10.0)
-
-        target_size = max(
-            self._MIN_ZOOM_POINT_SIZE,
-            min(self._MAX_ZOOM_POINT_SIZE, current_size + float(step_direction)),
-        )
-        if abs(target_size - current_size) < 1e-6:
-            return
-
-        font.setPointSizeF(target_size)
-        self.setFont(font)
-        self._line_number_area.setFont(font)
-        self._sync_font_dependent_metrics()
+        target_size = self.code_zoom_point_size() + float(step_direction)
+        self.set_code_zoom_point_size(target_size)
 
     def _sync_font_dependent_metrics(self) -> None:
         self.setTabStopDistance(QFontMetrics(self.font()).horizontalAdvance(" ") * self._indent_size)
