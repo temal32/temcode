@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QDockWidget,
     QFileDialog,
     QFileSystemModel,
@@ -2436,13 +2437,90 @@ class MainWindow(QMainWindow):
         return offset
 
     def open_settings_dialog(self) -> None:
+        settings_path = self._workspace_settings_path()
+        payload: dict[str, object] = self._default_settings_payload()
+
+        try:
+            self._ensure_workspace_settings_file(settings_path)
+            with open(settings_path, "r", encoding="utf-8") as handle:
+                parsed_payload = json.load(handle)
+            if isinstance(parsed_payload, dict):
+                payload = parsed_payload
+            else:
+                self.log("[settings] Root JSON must be an object; opening dialog with defaults.")
+        except OSError as exc:
+            self.log(f"[settings] Could not read {settings_path} for settings dialog: {exc}")
+        except json.JSONDecodeError as exc:
+            self.log(f"[settings] Invalid JSON in {settings_path}; opening dialog with defaults: {exc}")
+
+        autosave_payload = payload.get("autosave")
+        if not isinstance(autosave_payload, dict):
+            autosave_payload = {}
+        strategy_value = autosave_payload.get("strategy")
+        autosave_strategy = strategy_value.strip() if isinstance(strategy_value, str) else ""
+        if not autosave_strategy:
+            autosave_strategy = "backup"
+
+        ui_payload = payload.get("ui")
+        if not isinstance(ui_payload, dict):
+            ui_payload = {}
+
+        layout_value = ui_payload.get("bottom_panel_layout")
+        if layout_value in {self._BOTTOM_LAYOUT_STACKED, self._BOTTOM_LAYOUT_SIDE_BY_SIDE}:
+            initial_bottom_layout = layout_value
+        else:
+            initial_bottom_layout = self._bottom_layout_mode
+
+        output_enabled_value = ui_payload.get("output_enabled")
+        initial_output_enabled = output_enabled_value if isinstance(output_enabled_value, bool) else self.output_dock.isVisible()
+
+        terminal_enabled_value = ui_payload.get("terminal_enabled")
+        initial_terminal_enabled = (
+            terminal_enabled_value
+            if isinstance(terminal_enabled_value, bool)
+            else self.terminal_dock.isVisible()
+        )
+
+        window_payload = ui_payload.get("window")
+        if not isinstance(window_payload, dict):
+            window_payload = {}
+
+        use_last_size_value = window_payload.get("use_last_size")
+        initial_window_use_last_size = use_last_size_value if isinstance(use_last_size_value, bool) else False
+
+        def _parse_dimension(value: object, minimum: int, fallback: int) -> int:
+            if isinstance(value, bool):
+                return fallback
+            try:
+                parsed_value = int(value)
+            except (TypeError, ValueError):
+                return fallback
+            return max(minimum, parsed_value)
+
+        initial_window_width = _parse_dimension(
+            window_payload.get("width"),
+            self._MIN_WINDOW_WIDTH,
+            max(self._MIN_WINDOW_WIDTH, int(self.width())),
+        )
+        initial_window_height = _parse_dimension(
+            window_payload.get("height"),
+            self._MIN_WINDOW_HEIGHT,
+            max(self._MIN_WINDOW_HEIGHT, int(self.height())),
+        )
+
         dialog = QDialog(self)
         dialog.setWindowTitle("Settings")
         dialog.setModal(True)
+        dialog.resize(840, 580)
+        dialog.setMinimumSize(760, 520)
 
         layout = QVBoxLayout(dialog)
-        form_layout = QFormLayout()
-        form_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        tabs = QTabWidget(dialog)
+        layout.addWidget(tabs, 1)
+
+        appearance_tab = QWidget(dialog)
+        appearance_form = QFormLayout(appearance_tab)
+        appearance_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         theme_combobox = QComboBox(dialog)
         for theme_id in available_theme_ids():
@@ -2451,6 +2529,42 @@ class MainWindow(QMainWindow):
         if current_theme_index >= 0:
             theme_combobox.setCurrentIndex(current_theme_index)
 
+        ui_zoom_spinbox = QSpinBox(dialog)
+        ui_zoom_spinbox.setRange(self._MIN_UI_ZOOM_PERCENT, self._MAX_UI_ZOOM_PERCENT)
+        ui_zoom_spinbox.setValue(self._ui_zoom_percent)
+        ui_zoom_spinbox.setSuffix(" %")
+
+        code_zoom_fallback = self._code_zoom_point_size
+        if code_zoom_fallback is None:
+            current_editor = self._current_editor()
+            code_zoom_fallback = current_editor.code_zoom_point_size() if current_editor is not None else 10.0
+        code_zoom_fallback = self._clamp_code_zoom_point_size(code_zoom_fallback)
+
+        code_zoom_override_checkbox = QCheckBox("Override editor font size", dialog)
+        code_zoom_override_checkbox.setChecked(self._code_zoom_point_size is not None)
+
+        code_zoom_spinbox = QDoubleSpinBox(dialog)
+        code_zoom_spinbox.setRange(self._MIN_CODE_ZOOM_POINT_SIZE, self._MAX_CODE_ZOOM_POINT_SIZE)
+        code_zoom_spinbox.setSingleStep(0.5)
+        code_zoom_spinbox.setDecimals(1)
+        code_zoom_spinbox.setValue(code_zoom_fallback)
+        code_zoom_spinbox.setSuffix(" pt")
+        code_zoom_spinbox.setEnabled(self._code_zoom_point_size is not None)
+        code_zoom_override_checkbox.toggled.connect(code_zoom_spinbox.setEnabled)
+
+        appearance_form.addRow("Theme", theme_combobox)
+        appearance_form.addRow("UI zoom", ui_zoom_spinbox)
+        appearance_form.addRow(code_zoom_override_checkbox)
+        appearance_form.addRow("Code zoom", code_zoom_spinbox)
+        tabs.addTab(appearance_tab, "Appearance")
+
+        behavior_tab = QWidget(dialog)
+        behavior_layout = QVBoxLayout(behavior_tab)
+        behavior_layout.setContentsMargins(0, 0, 0, 0)
+        behavior_layout.setSpacing(10)
+
+        autosave_form = QFormLayout()
+        autosave_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         autosave_enabled_checkbox = QCheckBox("Enable autosave backups", dialog)
         autosave_enabled_checkbox.setChecked(self._autosave_enabled)
 
@@ -2464,10 +2578,86 @@ class MainWindow(QMainWindow):
         autosave_interval_spinbox.setEnabled(self._autosave_enabled)
         autosave_enabled_checkbox.toggled.connect(autosave_interval_spinbox.setEnabled)
 
-        form_layout.addRow("Theme", theme_combobox)
-        form_layout.addRow("Autosave", autosave_enabled_checkbox)
-        form_layout.addRow("Interval", autosave_interval_spinbox)
-        layout.addLayout(form_layout)
+        autosave_strategy_combobox = QComboBox(dialog)
+        autosave_strategy_combobox.setEditable(True)
+        autosave_strategy_combobox.addItem("backup")
+        if autosave_strategy.lower() != "backup":
+            autosave_strategy_combobox.addItem(autosave_strategy)
+        autosave_strategy_combobox.setCurrentText(autosave_strategy)
+
+        autosave_form.addRow("Autosave", autosave_enabled_checkbox)
+        autosave_form.addRow("Interval", autosave_interval_spinbox)
+        autosave_form.addRow("Strategy", autosave_strategy_combobox)
+
+        panels_form = QFormLayout()
+        panels_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        bottom_layout_combobox = QComboBox(dialog)
+        bottom_layout_combobox.addItem("Stacked", self._BOTTOM_LAYOUT_STACKED)
+        bottom_layout_combobox.addItem("Side by side", self._BOTTOM_LAYOUT_SIDE_BY_SIDE)
+        current_bottom_layout_index = bottom_layout_combobox.findData(initial_bottom_layout)
+        if current_bottom_layout_index >= 0:
+            bottom_layout_combobox.setCurrentIndex(current_bottom_layout_index)
+
+        output_enabled_checkbox = QCheckBox("Show Output panel", dialog)
+        output_enabled_checkbox.setChecked(initial_output_enabled)
+
+        terminal_enabled_checkbox = QCheckBox("Show Terminal panel", dialog)
+        terminal_enabled_checkbox.setChecked(initial_terminal_enabled)
+
+        panels_form.addRow("Bottom layout", bottom_layout_combobox)
+        panels_form.addRow("Output", output_enabled_checkbox)
+        panels_form.addRow("Terminal", terminal_enabled_checkbox)
+
+        panels_separator = QFrame(behavior_tab)
+        panels_separator.setFrameShape(QFrame.Shape.HLine)
+        panels_separator.setFrameShadow(QFrame.Shadow.Sunken)
+
+        behavior_layout.addLayout(autosave_form)
+        behavior_layout.addWidget(panels_separator)
+        behavior_layout.addLayout(panels_form)
+        behavior_layout.addStretch(1)
+        tabs.addTab(behavior_tab, "Behavior")
+
+        startup_tab = QWidget(dialog)
+        startup_layout = QVBoxLayout(startup_tab)
+        startup_layout.setContentsMargins(0, 0, 0, 0)
+        startup_layout.setSpacing(8)
+
+        startup_note_label = QLabel(
+            "Window size settings are applied the next time Temcode starts.",
+            startup_tab,
+        )
+        startup_note_label.setWordWrap(True)
+        startup_layout.addWidget(startup_note_label)
+
+        startup_form = QFormLayout()
+        startup_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        window_use_last_size_checkbox = QCheckBox("Restore last/custom size on startup", dialog)
+        window_use_last_size_checkbox.setChecked(initial_window_use_last_size)
+
+        window_width_spinbox = QSpinBox(dialog)
+        window_width_spinbox.setRange(self._MIN_WINDOW_WIDTH, 9999)
+        window_width_spinbox.setValue(initial_window_width)
+        window_width_spinbox.setSuffix(" px")
+
+        window_height_spinbox = QSpinBox(dialog)
+        window_height_spinbox.setRange(self._MIN_WINDOW_HEIGHT, 9999)
+        window_height_spinbox.setValue(initial_window_height)
+        window_height_spinbox.setSuffix(" px")
+
+        window_width_spinbox.setEnabled(initial_window_use_last_size)
+        window_height_spinbox.setEnabled(initial_window_use_last_size)
+        window_use_last_size_checkbox.toggled.connect(window_width_spinbox.setEnabled)
+        window_use_last_size_checkbox.toggled.connect(window_height_spinbox.setEnabled)
+
+        startup_form.addRow("Startup mode", window_use_last_size_checkbox)
+        startup_form.addRow("Window width", window_width_spinbox)
+        startup_form.addRow("Window height", window_height_spinbox)
+        startup_layout.addLayout(startup_form)
+        startup_layout.addStretch(1)
+        tabs.addTab(startup_tab, "Startup")
 
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
@@ -2482,22 +2672,68 @@ class MainWindow(QMainWindow):
 
         selected_theme_data = theme_combobox.currentData()
         selected_theme_id = normalize_theme_id(selected_theme_data if isinstance(selected_theme_data, str) else None)
-        self._apply_theme(selected_theme_id)
 
-        self._autosave_enabled = autosave_enabled_checkbox.isChecked()
-        self._autosave_interval_seconds = max(
-            self._MIN_AUTOSAVE_INTERVAL_SECONDS,
-            min(self._MAX_AUTOSAVE_INTERVAL_SECONDS, int(autosave_interval_spinbox.value())),
+        selected_ui_zoom = max(
+            self._MIN_UI_ZOOM_PERCENT,
+            min(self._MAX_UI_ZOOM_PERCENT, int(ui_zoom_spinbox.value())),
         )
-        self._autosave_last_summary = ""
-        self._configure_autosave_timer()
+        selected_code_zoom = (
+            self._clamp_code_zoom_point_size(code_zoom_spinbox.value())
+            if code_zoom_override_checkbox.isChecked()
+            else None
+        )
+        selected_bottom_layout_data = bottom_layout_combobox.currentData()
+        selected_bottom_layout = (
+            selected_bottom_layout_data
+            if selected_bottom_layout_data in {self._BOTTOM_LAYOUT_STACKED, self._BOTTOM_LAYOUT_SIDE_BY_SIDE}
+            else self._BOTTOM_LAYOUT_STACKED
+        )
+        selected_autosave_strategy = autosave_strategy_combobox.currentText().strip() or "backup"
+        selected_window_use_last_size = window_use_last_size_checkbox.isChecked()
+        selected_window_width = max(self._MIN_WINDOW_WIDTH, int(window_width_spinbox.value()))
+        selected_window_height = max(self._MIN_WINDOW_HEIGHT, int(window_height_spinbox.value()))
 
-        if self._persist_settings_preferences():
+        self._suspend_ui_settings_persistence = True
+        try:
+            self._apply_theme(selected_theme_id)
+            self._set_ui_zoom_percent(selected_ui_zoom, persist=False)
+            self._code_zoom_point_size = selected_code_zoom
+            if selected_code_zoom is not None:
+                self._apply_code_zoom_to_open_editors()
+
+            self._autosave_enabled = autosave_enabled_checkbox.isChecked()
+            self._autosave_interval_seconds = max(
+                self._MIN_AUTOSAVE_INTERVAL_SECONDS,
+                min(self._MAX_AUTOSAVE_INTERVAL_SECONDS, int(autosave_interval_spinbox.value())),
+            )
+            self._autosave_last_summary = ""
+            self._configure_autosave_timer()
+
+            self._apply_bottom_layout_setting(selected_bottom_layout)
+            self._apply_bottom_panel_visibility_settings(
+                output_enabled_checkbox.isChecked(),
+                terminal_enabled_checkbox.isChecked(),
+            )
+        finally:
+            self._suspend_ui_settings_persistence = False
+
+        if self._persist_settings_preferences(
+            autosave_strategy=selected_autosave_strategy,
+            window_use_last_size=selected_window_use_last_size,
+            window_width=selected_window_width,
+            window_height=selected_window_height,
+        ):
             self.statusBar().showMessage("Settings saved.", 2200)
             self.log(
-                f"[settings] Preferences updated: theme={self._theme_id}, "
+                f"[settings] Preferences updated: theme={self._theme_id}, ui_zoom={self._ui_zoom_percent}%, "
+                f"code_zoom={self._code_zoom_point_size}, "
                 f"autosave_enabled={self._autosave_enabled}, "
-                f"autosave_interval={self._autosave_interval_seconds}s"
+                f"autosave_interval={self._autosave_interval_seconds}s, "
+                f"autosave_strategy={selected_autosave_strategy}, "
+                f"layout={self._bottom_layout_mode}, "
+                f"output_visible={self.output_dock.isVisible()}, terminal_visible={self.terminal_dock.isVisible()}, "
+                f"window_use_last_size={selected_window_use_last_size}, "
+                f"window={selected_window_width}x{selected_window_height}"
             )
         else:
             self.statusBar().showMessage("Applied settings, but failed to write settings file.", 3200)
@@ -2764,7 +3000,14 @@ class MainWindow(QMainWindow):
         finally:
             self._suspend_ui_settings_persistence = False
 
-    def _persist_settings_preferences(self) -> bool:
+    def _persist_settings_preferences(
+        self,
+        *,
+        autosave_strategy: str | None = None,
+        window_use_last_size: bool | None = None,
+        window_width: int | None = None,
+        window_height: int | None = None,
+    ) -> bool:
         settings_path = self._workspace_settings_path()
         payload: dict[str, object] = self._default_settings_payload()
 
@@ -2782,12 +3025,23 @@ class MainWindow(QMainWindow):
         except json.JSONDecodeError as exc:
             self.log(f"[settings] Invalid JSON in {settings_path}; rewriting settings sections: {exc}")
 
+        def _normalize_int(value: object, minimum: int, fallback: int) -> int:
+            if isinstance(value, bool):
+                return fallback
+            try:
+                parsed_value = int(value)
+            except (TypeError, ValueError):
+                return fallback
+            return max(minimum, parsed_value)
+
         autosave_payload = payload.get("autosave")
         if not isinstance(autosave_payload, dict):
             autosave_payload = {}
         autosave_payload["enabled"] = self._autosave_enabled
         autosave_payload["interval_seconds"] = self._autosave_interval_seconds
-        autosave_payload.setdefault("strategy", "backup")
+        strategy_value = autosave_strategy if isinstance(autosave_strategy, str) else autosave_payload.get("strategy")
+        normalized_strategy = strategy_value.strip() if isinstance(strategy_value, str) else ""
+        autosave_payload["strategy"] = normalized_strategy or "backup"
         payload["autosave"] = autosave_payload
 
         ui_payload = payload.get("ui")
@@ -2796,6 +3050,33 @@ class MainWindow(QMainWindow):
         ui_payload["theme"] = self._theme_id
         ui_payload["zoom_percent"] = self._ui_zoom_percent
         ui_payload["code_zoom_point_size"] = self._code_zoom_point_size
+        ui_payload["bottom_panel_layout"] = self._bottom_layout_mode
+        ui_payload["output_enabled"] = self.output_dock.isVisible()
+        ui_payload["terminal_enabled"] = self.terminal_dock.isVisible()
+
+        current_width = max(self._MIN_WINDOW_WIDTH, int(self.width()))
+        current_height = max(self._MIN_WINDOW_HEIGHT, int(self.height()))
+        window_payload = ui_payload.get("window")
+        if not isinstance(window_payload, dict):
+            window_payload = {}
+        existing_use_last_size = window_payload.get("use_last_size")
+        resolved_use_last_size = (
+            window_use_last_size
+            if isinstance(window_use_last_size, bool)
+            else (existing_use_last_size if isinstance(existing_use_last_size, bool) else False)
+        )
+        window_payload["use_last_size"] = resolved_use_last_size
+        window_payload["width"] = _normalize_int(
+            window_width if window_width is not None else window_payload.get("width"),
+            self._MIN_WINDOW_WIDTH,
+            current_width,
+        )
+        window_payload["height"] = _normalize_int(
+            window_height if window_height is not None else window_payload.get("height"),
+            self._MIN_WINDOW_HEIGHT,
+            current_height,
+        )
+        ui_payload["window"] = window_payload
         payload["ui"] = ui_payload
 
         try:
@@ -2836,16 +3117,41 @@ class MainWindow(QMainWindow):
         ui_payload["bottom_panel_layout"] = self._bottom_layout_mode
         ui_payload["output_enabled"] = self.output_dock.isVisible()
         ui_payload["terminal_enabled"] = self.terminal_dock.isVisible()
-        if not (self.isFullScreen() or self.isMaximized() or self.isMinimized()):
-            current_width = max(self._MIN_WINDOW_WIDTH, int(self.width()))
-            current_height = max(self._MIN_WINDOW_HEIGHT, int(self.height()))
-            window_payload = ui_payload.get("window")
-            if not isinstance(window_payload, dict):
-                window_payload = {}
-            window_payload["use_last_size"] = True
-            window_payload["width"] = current_width
-            window_payload["height"] = current_height
-            ui_payload["window"] = window_payload
+        window_payload = ui_payload.get("window")
+        if not isinstance(window_payload, dict):
+            window_payload = {}
+        use_last_size_value = window_payload.get("use_last_size")
+        use_last_size = use_last_size_value if isinstance(use_last_size_value, bool) else False
+        window_payload["use_last_size"] = use_last_size
+
+        current_width = max(self._MIN_WINDOW_WIDTH, int(self.width()))
+        current_height = max(self._MIN_WINDOW_HEIGHT, int(self.height()))
+
+        persisted_width = window_payload.get("width")
+        if isinstance(persisted_width, bool):
+            persisted_width = current_width
+        try:
+            normalized_width = int(persisted_width)
+        except (TypeError, ValueError):
+            normalized_width = current_width
+        normalized_width = max(self._MIN_WINDOW_WIDTH, normalized_width)
+
+        persisted_height = window_payload.get("height")
+        if isinstance(persisted_height, bool):
+            persisted_height = current_height
+        try:
+            normalized_height = int(persisted_height)
+        except (TypeError, ValueError):
+            normalized_height = current_height
+        normalized_height = max(self._MIN_WINDOW_HEIGHT, normalized_height)
+
+        if use_last_size and not (self.isFullScreen() or self.isMaximized() or self.isMinimized()):
+            normalized_width = current_width
+            normalized_height = current_height
+
+        window_payload["width"] = normalized_width
+        window_payload["height"] = normalized_height
+        ui_payload["window"] = window_payload
         payload["ui"] = ui_payload
 
         try:
