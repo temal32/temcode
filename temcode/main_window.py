@@ -98,6 +98,13 @@ class MainWindow(QMainWindow):
     _LSP_MAX_DIAGNOSTIC_SELECTIONS = 350
     _MAX_WORKSPACE_SEARCH_RESULTS = 1200
     _SEARCH_SNIPPET_MAX_LENGTH = 160
+    _GIT_STATUS_MAX_ENTRIES = 4000
+    _GIT_LOG_MAX_ENTRIES = 200
+    _GIT_COMMAND_TIMEOUT_SECONDS = 120
+    _GIT_DISCOVERY_MAX_DIRECTORIES = 12000
+    _GIT_DISCOVERY_MAX_SECONDS = 2.5
+    _GIT_REMOTE_CHECK_MIN_INTERVAL_SECONDS = 20.0
+    _GIT_REMOTE_CHECK_TIMEOUT_SECONDS = 45
     _SEARCH_IGNORED_DIRECTORIES = {
         ".git",
         ".hg",
@@ -192,6 +199,14 @@ class MainWindow(QMainWindow):
         self._lsp_ready = False
         self._lsp_status_message = "idle"
         self._solution_nav_panel = "explorer"
+        self._git_known_repositories: list[str] = []
+        self._git_active_repository: str | None = None
+        self._git_status_entries: list[dict[str, object]] = []
+        self._git_branch_summary = ""
+        self._git_repo_scan_workspace: str | None = None
+        self._git_last_remote_check_by_repo: dict[str, float] = {}
+        self._git_remote_delta_by_repo: dict[str, tuple[int, int]] = {}
+        self._git_remote_prompted_head_by_repo: dict[str, str] = {}
 
         self.setWindowTitle("Temcode")
         self.resize(1920, 980)
@@ -213,6 +228,7 @@ class MainWindow(QMainWindow):
         self._sync_file_watcher_paths()
         self._refresh_breadcrumbs()
         self._update_solution_explorer_surface()
+        self._refresh_git_repositories(preserve_selection=False)
         self._refresh_lsp_status_label()
         self._file_poll_timer.start()
         self._apply_pointing_cursor_to_buttons(self)
@@ -846,6 +862,7 @@ class MainWindow(QMainWindow):
         button_names = (
             "solution_nav_explorer_button",
             "solution_nav_search_button",
+            "solution_nav_git_button",
             "solution_nav_settings_button",
         )
         for button_name in button_names:
@@ -890,11 +907,13 @@ class MainWindow(QMainWindow):
         self.solution_explorer_stack.addWidget(self.file_tree)
 
         self.solution_search_page = self._build_solution_search_page(self.solution_explorer_dock)
+        self.solution_git_page = self._build_solution_git_page(self.solution_explorer_dock)
 
         self.solution_side_panel_stack = QStackedWidget(self.solution_explorer_dock)
         self.solution_side_panel_stack.setObjectName("solutionSidePanelStack")
         self.solution_side_panel_stack.addWidget(self.solution_explorer_stack)
         self.solution_side_panel_stack.addWidget(self.solution_search_page)
+        self.solution_side_panel_stack.addWidget(self.solution_git_page)
 
         dock_content = QWidget(self.solution_explorer_dock)
         dock_content_layout = QHBoxLayout(dock_content)
@@ -933,6 +952,17 @@ class MainWindow(QMainWindow):
         )
         self.solution_nav_search_button.clicked.connect(lambda _checked=False: self._show_solution_panel("search"))
         nav_layout.addWidget(self.solution_nav_search_button, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        self.solution_nav_git_button = self._create_solution_nav_button(
+            object_name="solutionNavGitButton",
+            icon_type=QStyle.StandardPixmap.SP_BrowserReload,
+            theme_icon_name="vcs-normal",
+            tooltip_text="Git",
+            button_size=nav_button_size,
+            icon_size=nav_icon_size,
+        )
+        self.solution_nav_git_button.clicked.connect(lambda _checked=False: self._show_solution_panel("git"))
+        nav_layout.addWidget(self.solution_nav_git_button, 0, Qt.AlignmentFlag.AlignHCenter)
         nav_layout.addStretch(1)
 
         self.solution_nav_settings_button = self._create_solution_nav_button(
@@ -1027,14 +1057,224 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.solution_search_results, 1)
         return page
 
+    def _build_solution_git_page(self, parent: QWidget) -> QWidget:
+        page = QWidget(parent)
+        page.setObjectName("solutionGitPage")
+
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self.git_changes_header_label = QLabel("CHANGES", page)
+        self.git_changes_header_label.setObjectName("gitSectionTitle")
+
+        repo_row = QHBoxLayout()
+        repo_row.setContentsMargins(0, 0, 0, 0)
+        repo_row.setSpacing(6)
+
+        self.git_repo_combo = QComboBox(page)
+        self.git_repo_combo.setObjectName("gitRepoCombo")
+        self.git_repo_combo.currentIndexChanged.connect(self._on_git_repository_changed)
+
+        self.git_scan_button = QPushButton("Scan", page)
+        self.git_scan_button.setObjectName("gitScanButton")
+        self.git_scan_button.clicked.connect(lambda: self._refresh_git_repositories(preserve_selection=False))
+
+        self.git_refresh_button = QPushButton("Refresh", page)
+        self.git_refresh_button.setObjectName("gitRefreshButton")
+        self.git_refresh_button.clicked.connect(self._refresh_git_status_and_remote_check)
+
+        repo_row.addWidget(self.git_repo_combo, 1)
+        repo_row.addWidget(self.git_scan_button, 0)
+        repo_row.addWidget(self.git_refresh_button, 0)
+
+        self.git_repo_summary_label = QLabel("No repository detected.", page)
+        self.git_repo_summary_label.setWordWrap(True)
+
+        branch_row = QHBoxLayout()
+        branch_row.setContentsMargins(0, 0, 0, 0)
+        branch_row.setSpacing(6)
+
+        self.git_branch_combo = QComboBox(page)
+        self.git_branch_combo.setObjectName("gitBranchCombo")
+
+        self.git_checkout_button = QPushButton("Checkout", page)
+        self.git_checkout_button.setObjectName("gitCheckoutButton")
+        self.git_checkout_button.clicked.connect(self._git_checkout_selected_branch)
+
+        self.git_new_branch_input = QLineEdit(page)
+        self.git_new_branch_input.setObjectName("gitNewBranchInput")
+        self.git_new_branch_input.setPlaceholderText("new-branch-name")
+        self.git_new_branch_input.returnPressed.connect(self._git_create_and_checkout_branch)
+
+        self.git_new_branch_button = QPushButton("Create + Checkout", page)
+        self.git_new_branch_button.setObjectName("gitNewBranchButton")
+        self.git_new_branch_button.clicked.connect(self._git_create_and_checkout_branch)
+
+        branch_row.addWidget(self.git_branch_combo, 1)
+        branch_row.addWidget(self.git_checkout_button, 0)
+        branch_row.addWidget(self.git_new_branch_input, 1)
+        branch_row.addWidget(self.git_new_branch_button, 0)
+
+        remote_row = QHBoxLayout()
+        remote_row.setContentsMargins(0, 0, 0, 0)
+        remote_row.setSpacing(6)
+
+        self.git_pull_button = QPushButton("Pull", page)
+        self.git_pull_button.setObjectName("gitPullButton")
+        self.git_pull_button.clicked.connect(self._git_pull)
+        self.git_push_button = QPushButton("Push", page)
+        self.git_push_button.setObjectName("gitPushButton")
+        self.git_push_button.clicked.connect(self._git_push)
+        self.git_sync_button = QPushButton("Sync", page)
+        self.git_sync_button.setObjectName("gitSyncButton")
+        self.git_sync_button.clicked.connect(self._git_sync)
+
+        remote_row.addWidget(self.git_pull_button, 0)
+        remote_row.addWidget(self.git_push_button, 0)
+        remote_row.addWidget(self.git_sync_button, 0)
+        remote_row.addStretch(1)
+
+        commit_row = QHBoxLayout()
+        commit_row.setContentsMargins(0, 0, 0, 0)
+        commit_row.setSpacing(6)
+
+        self.git_commit_input = QLineEdit(page)
+        self.git_commit_input.setObjectName("gitCommitInput")
+        self.git_commit_input.setPlaceholderText("Message (Enter to commit)")
+        self.git_commit_input.returnPressed.connect(self._git_commit_changes)
+
+        self.git_commit_button = QToolButton(page)
+        self.git_commit_button.setObjectName("gitCommitSplitButton")
+        self.git_commit_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.git_commit_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.git_commit_button.setText("Commit")
+        self.git_commit_button.clicked.connect(self._git_commit_changes)
+
+        self.git_commit_menu = QMenu(self.git_commit_button)
+        self.git_commit_menu.setObjectName("gitCommitMenu")
+        self.git_commit_action = QAction("Commit", self.git_commit_menu)
+        self.git_commit_action.triggered.connect(self._git_commit_changes)
+        self.git_commit_push_action = QAction("Commit & Push", self.git_commit_menu)
+        self.git_commit_push_action.triggered.connect(self._git_commit_and_push)
+        self.git_commit_menu.addAction(self.git_commit_action)
+        self.git_commit_menu.addAction(self.git_commit_push_action)
+        self.git_commit_button.setMenu(self.git_commit_menu)
+
+        commit_row.addWidget(self.git_commit_input, 1)
+        commit_row.addWidget(self.git_commit_button, 0)
+
+        changes_actions_row = QHBoxLayout()
+        changes_actions_row.setContentsMargins(0, 0, 0, 0)
+        changes_actions_row.setSpacing(6)
+
+        self.git_discard_selected_button = QPushButton("Discard Selected", page)
+        self.git_discard_selected_button.clicked.connect(self._git_discard_selected)
+
+        changes_actions_row.addWidget(self.git_discard_selected_button, 0)
+        changes_actions_row.addStretch(1)
+
+        destructive_row = QHBoxLayout()
+        destructive_row.setContentsMargins(0, 0, 0, 0)
+        destructive_row.setSpacing(6)
+
+        self.git_reset_hard_button = QPushButton("Reset Hard", page)
+        self.git_reset_hard_button.clicked.connect(self._git_reset_hard)
+        self.git_clean_untracked_button = QPushButton("Clean Untracked", page)
+        self.git_clean_untracked_button.clicked.connect(self._git_clean_untracked)
+        self.git_open_file_button = QPushButton("Open Selected File", page)
+        self.git_open_file_button.clicked.connect(self._git_open_selected_file)
+
+        destructive_row.addWidget(self.git_reset_hard_button, 0)
+        destructive_row.addWidget(self.git_clean_untracked_button, 0)
+        destructive_row.addWidget(self.git_open_file_button, 0)
+        destructive_row.addStretch(1)
+
+        self.git_changes_list = QListWidget(page)
+        self.git_changes_list.setObjectName("gitChangesList")
+        self.git_changes_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.git_changes_list.itemSelectionChanged.connect(self._on_git_change_selection_changed)
+        self.git_changes_list.itemActivated.connect(self._on_git_change_activated)
+
+        self.git_diff_view = QPlainTextEdit(page)
+        self.git_diff_view.setObjectName("gitDiffView")
+        self.git_diff_view.setReadOnly(True)
+        self.git_diff_view.setPlainText("Select a changed file to preview diff.")
+
+        self.git_log_list = QListWidget(page)
+        self.git_log_list.setObjectName("gitLogList")
+        self.git_log_list.itemActivated.connect(self._on_git_log_activated)
+
+        self.git_graph_header_label = QLabel("GRAPH", page)
+        self.git_graph_header_label.setObjectName("gitSectionTitle")
+
+        self.git_log_refresh_button = QPushButton("Refresh", page)
+        self.git_log_refresh_button.setObjectName("gitRefreshLogButton")
+        self.git_log_refresh_button.clicked.connect(self._refresh_git_log)
+
+        list_splitter = QSplitter(Qt.Orientation.Vertical, page)
+        list_splitter.addWidget(self.git_changes_list)
+        list_splitter.addWidget(self.git_diff_view)
+        list_splitter.setChildrenCollapsible(False)
+        list_splitter.setSizes([280, 260])
+
+        log_layout = QVBoxLayout()
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.setSpacing(6)
+        graph_header_row = QHBoxLayout()
+        graph_header_row.setContentsMargins(0, 0, 0, 0)
+        graph_header_row.setSpacing(6)
+        graph_header_row.addWidget(self.git_graph_header_label, 0)
+        graph_header_row.addStretch(1)
+        graph_header_row.addWidget(self.git_log_refresh_button, 0)
+        log_layout.addLayout(graph_header_row)
+        log_layout.addWidget(self.git_log_list, 1)
+
+        content_splitter = QSplitter(Qt.Orientation.Vertical, page)
+        top_container = QWidget(page)
+        top_layout = QVBoxLayout(top_container)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(0)
+        top_layout.addWidget(list_splitter)
+        content_splitter.addWidget(top_container)
+
+        log_container = QWidget(page)
+        log_container.setLayout(log_layout)
+        content_splitter.addWidget(log_container)
+        content_splitter.setChildrenCollapsible(False)
+        content_splitter.setSizes([420, 180])
+
+        layout.addWidget(self.git_changes_header_label, 0)
+        layout.addLayout(repo_row)
+        layout.addWidget(self.git_repo_summary_label, 0)
+        layout.addLayout(branch_row)
+        layout.addLayout(remote_row)
+        layout.addLayout(commit_row)
+        layout.addLayout(changes_actions_row)
+        layout.addLayout(destructive_row)
+        layout.addWidget(content_splitter, 1)
+
+        return page
+
     def _show_solution_panel(self, panel_name: str) -> None:
-        normalized = "search" if panel_name == "search" else "explorer"
+        normalized = panel_name if panel_name in {"search", "git"} else "explorer"
         self._solution_nav_panel = normalized
 
         if normalized == "search":
             self.solution_side_panel_stack.setCurrentWidget(self.solution_search_page)
             self.solution_nav_search_button.setChecked(True)
             self.solution_search_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        elif normalized == "git":
+            self.solution_side_panel_stack.setCurrentWidget(self.solution_git_page)
+            self.solution_nav_git_button.setChecked(True)
+            workspace_key = self._normalize_path(self.workspace_root) if self.workspace_root else None
+            has_cached_repos = bool(self._git_known_repositories)
+            same_workspace_scan = workspace_key == self._git_repo_scan_workspace
+            if has_cached_repos and same_workspace_scan:
+                self._refresh_git_status_panel()
+            else:
+                self._refresh_git_repositories()
+            QTimer.singleShot(0, lambda: self._check_git_remote_updates(force=True, prompt_for_pull=True))
         else:
             self.solution_side_panel_stack.setCurrentWidget(self.solution_explorer_stack)
             self.solution_nav_explorer_button.setChecked(True)
@@ -1046,6 +1286,9 @@ class MainWindow(QMainWindow):
             return
         if self._solution_nav_panel == "search":
             self.solution_explorer_dock.setWindowTitle("Search")
+            return
+        if self._solution_nav_panel == "git":
+            self.solution_explorer_dock.setWindowTitle("Git")
             return
 
         if self.workspace_root and os.path.isdir(self.workspace_root):
@@ -1274,6 +1517,1197 @@ class MainWindow(QMainWindow):
             return False
         return b"\x00" in sample
 
+    @staticmethod
+    def _decode_git_output(raw: bytes) -> str:
+        if not raw:
+            return ""
+        for encoding in ("utf-8", "cp1252"):
+            try:
+                return raw.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("utf-8", errors="replace")
+
+    def _run_git_command_raw(
+        self,
+        repository_path: str,
+        args: list[str],
+        *,
+        timeout_seconds: int | None = None,
+    ) -> tuple[bool, bytes, str, int]:
+        timeout = timeout_seconds if isinstance(timeout_seconds, int) and timeout_seconds > 0 else self._GIT_COMMAND_TIMEOUT_SECONDS
+        command = ["git", "-C", repository_path, *args]
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=timeout,
+            )
+        except FileNotFoundError:
+            return False, b"", "System git executable was not found.", -1
+        except subprocess.TimeoutExpired:
+            return False, b"", f"Command timed out after {timeout} seconds.", -1
+        except OSError as exc:
+            return False, b"", str(exc), -1
+
+        stderr_text = self._decode_git_output(completed.stderr).strip()
+        return completed.returncode == 0, bytes(completed.stdout), stderr_text, int(completed.returncode)
+
+    def _run_git_command(
+        self,
+        repository_path: str,
+        args: list[str],
+        *,
+        timeout_seconds: int | None = None,
+    ) -> tuple[bool, str, str, int]:
+        ok, stdout_raw, stderr_text, exit_code = self._run_git_command_raw(
+            repository_path,
+            args,
+            timeout_seconds=timeout_seconds,
+        )
+        stdout_text = self._decode_git_output(stdout_raw).rstrip()
+        return ok, stdout_text, stderr_text, exit_code
+
+    def _git_repository_display_text(self, repository_path: str) -> str:
+        absolute_repo = os.path.abspath(repository_path)
+        if self.workspace_root and self._is_same_or_child(absolute_repo, self.workspace_root):
+            try:
+                relative = os.path.relpath(absolute_repo, self.workspace_root)
+            except ValueError:
+                relative = absolute_repo
+            if relative in {".", ""}:
+                return f"{os.path.basename(absolute_repo)} (workspace)"
+            return relative
+        return absolute_repo
+
+    def _discover_git_repositories(self) -> list[str]:
+        discovered: dict[str, str] = {}
+        started_at = time.monotonic()
+        scanned_directories = 0
+        truncated_scan = False
+
+        def add_from_probe(probe_path: str) -> None:
+            normalized_probe = os.path.abspath(probe_path)
+            if not os.path.isdir(normalized_probe):
+                return
+            ok, stdout_text, _stderr_text, _exit_code = self._run_git_command(
+                normalized_probe,
+                ["rev-parse", "--show-toplevel"],
+                timeout_seconds=20,
+            )
+            if not ok or not stdout_text:
+                return
+            repo_root = os.path.abspath(stdout_text.splitlines()[0].strip())
+            repo_key = self._normalize_path(repo_root)
+            discovered[repo_key] = repo_root
+
+        if self.workspace_root and os.path.isdir(self.workspace_root):
+            workspace = os.path.abspath(self.workspace_root)
+            add_from_probe(workspace)
+
+            for root_path, directory_names, file_names in os.walk(workspace):
+                scanned_directories += 1
+                if scanned_directories >= self._GIT_DISCOVERY_MAX_DIRECTORIES:
+                    truncated_scan = True
+                    break
+                if (time.monotonic() - started_at) >= self._GIT_DISCOVERY_MAX_SECONDS:
+                    truncated_scan = True
+                    break
+
+                has_git = ".git" in directory_names or ".git" in file_names
+                if has_git:
+                    add_from_probe(root_path)
+
+                directory_names[:] = [
+                    name
+                    for name in directory_names
+                    if name not in self._SEARCH_IGNORED_DIRECTORIES
+                ]
+        else:
+            current_widget = self._current_tab_widget()
+            current_file_path = self._widget_file_path(current_widget) if current_widget is not None else None
+            if current_file_path:
+                add_from_probe(os.path.dirname(os.path.abspath(current_file_path)))
+            add_from_probe(os.getcwd())
+
+        if truncated_scan:
+            self.log(
+                "[git] Repository discovery hit scan limit. Use Git > Scan to refresh if needed."
+            )
+
+        workspace_absolute = os.path.abspath(self.workspace_root) if self.workspace_root else None
+        ordered = sorted(
+            discovered.values(),
+            key=lambda path: (
+                0 if workspace_absolute and self._is_same_or_child(path, workspace_absolute) else 1,
+                len(path),
+                self._normalize_path(path),
+            ),
+        )
+        return ordered
+
+    def _refresh_git_repositories(self, preserve_selection: bool = True) -> None:
+        if not hasattr(self, "git_repo_combo"):
+            return
+
+        previous_repo = self._git_active_repository if preserve_selection else None
+        repos = self._discover_git_repositories()
+        self._git_known_repositories = repos
+        self._git_repo_scan_workspace = self._normalize_path(self.workspace_root) if self.workspace_root else None
+
+        self.git_repo_combo.blockSignals(True)
+        self.git_repo_combo.clear()
+        for repo_path in repos:
+            self.git_repo_combo.addItem(self._git_repository_display_text(repo_path), repo_path)
+
+        if not repos:
+            self._git_active_repository = None
+            self.git_repo_combo.blockSignals(False)
+            self.git_repo_summary_label.setText("No Git repository detected in the current workspace.")
+            self.git_changes_list.clear()
+            self.git_branch_combo.clear()
+            self.git_log_list.clear()
+            self.git_diff_view.setPlainText("Diff preview will appear here.")
+            self._set_git_controls_enabled(False)
+            return
+
+        selected_index = 0
+        if previous_repo:
+            previous_key = self._normalize_path(previous_repo)
+            for index, repo_path in enumerate(repos):
+                if self._normalize_path(repo_path) == previous_key:
+                    selected_index = index
+                    break
+
+        self.git_repo_combo.setCurrentIndex(selected_index)
+        selected_repo = self.git_repo_combo.currentData()
+        self._git_active_repository = selected_repo if isinstance(selected_repo, str) else repos[selected_index]
+        self.git_repo_combo.blockSignals(False)
+        self._set_git_controls_enabled(True)
+        self._refresh_git_status_panel()
+
+    def _set_git_controls_enabled(self, enabled: bool) -> None:
+        if not hasattr(self, "git_repo_combo"):
+            return
+
+        controls = (
+            self.git_refresh_button,
+            self.git_branch_combo,
+            self.git_checkout_button,
+            self.git_new_branch_input,
+            self.git_new_branch_button,
+            self.git_pull_button,
+            self.git_push_button,
+            self.git_sync_button,
+            self.git_commit_input,
+            self.git_commit_button,
+            self.git_discard_selected_button,
+            self.git_reset_hard_button,
+            self.git_clean_untracked_button,
+            self.git_open_file_button,
+            self.git_changes_list,
+            self.git_diff_view,
+            self.git_log_refresh_button,
+            self.git_log_list,
+        )
+        for control in controls:
+            control.setEnabled(enabled)
+
+    def _active_git_repository(self) -> str | None:
+        if self._git_active_repository and os.path.isdir(self._git_active_repository):
+            return os.path.abspath(self._git_active_repository)
+        return None
+
+    def _on_git_repository_changed(self, _index: int) -> None:
+        selected_repo = self.git_repo_combo.currentData()
+        if isinstance(selected_repo, str) and selected_repo:
+            self._git_active_repository = os.path.abspath(selected_repo)
+            self._set_git_controls_enabled(True)
+            self._refresh_git_status_panel()
+            if self._solution_nav_panel == "git":
+                QTimer.singleShot(0, lambda: self._check_git_remote_updates(force=True, prompt_for_pull=True))
+            return
+
+        self._git_active_repository = None
+        self._set_git_controls_enabled(False)
+        self.git_repo_summary_label.setText("No repository selected.")
+        self.git_changes_list.clear()
+        self.git_branch_combo.clear()
+        self.git_log_list.clear()
+        self.git_diff_view.setPlainText("Diff preview will appear here.")
+
+    def _refresh_git_status_and_remote_check(self) -> None:
+        self._refresh_git_status_panel()
+        self._check_git_remote_updates(force=True, prompt_for_pull=True)
+
+    def _refresh_git_status_panel(self) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            self.git_repo_summary_label.setText("No repository selected.")
+            return
+
+        self._refresh_git_status()
+        self._refresh_git_branches()
+        self._refresh_git_log()
+
+    def _parse_git_status_porcelain(self, payload: bytes) -> tuple[str, list[dict[str, object]]]:
+        branch_summary = ""
+        entries: list[dict[str, object]] = []
+        tokens = payload.split(b"\0")
+        index = 0
+
+        while index < len(tokens):
+            token = tokens[index]
+            index += 1
+            if not token:
+                continue
+
+            decoded = self._decode_git_output(token)
+            if decoded.startswith("## "):
+                branch_summary = decoded[3:].strip()
+                continue
+            if len(decoded) < 3:
+                continue
+
+            status = decoded[:2]
+            raw_path = decoded[3:]
+            old_path: str | None = None
+            new_path: str | None = None
+            display_path = raw_path
+            operation_path = raw_path
+
+            if status != "??" and ("R" in status or "C" in status):
+                if index < len(tokens):
+                    rename_target_token = tokens[index]
+                    index += 1
+                    if rename_target_token:
+                        new_path = self._decode_git_output(rename_target_token)
+                        old_path = raw_path
+                        operation_path = new_path
+                        display_path = f"{old_path} -> {new_path}"
+
+            staged = status[0] not in {" ", "?"}
+            unstaged = status[1] not in {" "}
+            untracked = status == "??"
+
+            entries.append(
+                {
+                    "status": status,
+                    "path": operation_path,
+                    "display_path": display_path,
+                    "old_path": old_path,
+                    "new_path": new_path,
+                    "staged": staged,
+                    "unstaged": unstaged,
+                    "untracked": untracked,
+                }
+            )
+            if len(entries) >= self._GIT_STATUS_MAX_ENTRIES:
+                break
+
+        return branch_summary, entries
+
+    def _git_status_badge(self, entry: dict[str, object]) -> str:
+        status_value = entry.get("status")
+        status = status_value if isinstance(status_value, str) else "  "
+        if status == "??":
+            return "UNTRACKED"
+        if status == "!!":
+            return "IGNORED"
+
+        staged = bool(entry.get("staged"))
+        unstaged = bool(entry.get("unstaged"))
+        if staged and unstaged:
+            return "INDEX+MOD"
+        if staged:
+            return "INDEX"
+        if unstaged:
+            return "MODIFIED"
+        return status.strip() or "CLEAN"
+
+    def _refresh_git_status(self) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            self._git_status_entries = []
+            self.git_changes_list.clear()
+            self.git_diff_view.setPlainText("Diff preview will appear here.")
+            return
+
+        ok, stdout_raw, stderr_text, _exit_code = self._run_git_command_raw(
+            repository_path,
+            ["status", "--porcelain=v1", "--branch", "-z"],
+            timeout_seconds=30,
+        )
+        if not ok:
+            self._git_status_entries = []
+            self.git_changes_list.clear()
+            error_detail = stderr_text or "Could not read git status."
+            self.git_repo_summary_label.setText(error_detail)
+            self.git_diff_view.setPlainText(error_detail)
+            return
+
+        previous_selected_paths = {
+            payload.get("path")
+            for payload in self._selected_git_entries()
+            if isinstance(payload.get("path"), str)
+        }
+
+        self._git_branch_summary, self._git_status_entries = self._parse_git_status_porcelain(stdout_raw)
+
+        self.git_changes_list.blockSignals(True)
+        self.git_changes_list.clear()
+
+        def add_section(section_title: str, entries: list[dict[str, object]]) -> None:
+            header_item = QListWidgetItem(f"{section_title} ({len(entries)})")
+            header_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            header_item.setData(Qt.ItemDataRole.UserRole, None)
+            header_item.setData(Qt.ItemDataRole.UserRole + 1, "header")
+            header_font = header_item.font()
+            header_font.setBold(True)
+            header_item.setFont(header_font)
+            self.git_changes_list.addItem(header_item)
+
+            for entry in entries:
+                display_path = entry.get("display_path")
+                path_label = display_path if isinstance(display_path, str) else "<unknown>"
+                badge = self._git_status_badge(entry)
+                item_text = f"  {path_label}  [{badge}]"
+                item = QListWidgetItem(item_text)
+                item.setData(Qt.ItemDataRole.UserRole, entry)
+                item.setData(Qt.ItemDataRole.UserRole + 1, "change")
+                item.setToolTip(item_text)
+                self.git_changes_list.addItem(item)
+
+        add_section("Changes", self._git_status_entries)
+
+        if previous_selected_paths:
+            remaining_selected_paths = set(previous_selected_paths)
+            for index in range(self.git_changes_list.count()):
+                item = self.git_changes_list.item(index)
+                payload = item.data(Qt.ItemDataRole.UserRole)
+                if not isinstance(payload, dict):
+                    continue
+                path_value = payload.get("path")
+                if path_value in remaining_selected_paths:
+                    item.setSelected(True)
+                    remaining_selected_paths.discard(path_value)
+
+        self.git_changes_list.blockSignals(False)
+
+        self._update_git_repo_summary_label()
+        if self.git_changes_list.selectedItems():
+            self._on_git_change_selection_changed()
+        else:
+            self.git_diff_view.setPlainText("Select a changed file to preview diff.")
+
+    def _update_git_repo_summary_label(self) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            self.git_repo_summary_label.setText("No repository selected.")
+            return
+
+        tracked_count = sum(1 for entry in self._git_status_entries if not entry.get("untracked"))
+        untracked_count = sum(1 for entry in self._git_status_entries if entry.get("untracked"))
+
+        summary_parts: list[str] = []
+        if self._git_branch_summary:
+            summary_parts.append(self._git_branch_summary)
+        summary_parts.append(
+            f"{len(self._git_status_entries)} local change(s) | tracked={tracked_count}, untracked={untracked_count}"
+        )
+
+        repo_key = self._normalize_path(repository_path)
+        remote_delta = self._git_remote_delta_by_repo.get(repo_key)
+        if remote_delta is not None:
+            ahead_count, behind_count = remote_delta
+            if ahead_count > 0 or behind_count > 0:
+                summary_parts.append(f"remote: {behind_count} behind, {ahead_count} ahead")
+            else:
+                summary_parts.append("remote: up to date")
+
+        self.git_repo_summary_label.setText(" | ".join(summary_parts))
+
+    def _selected_git_entries(self) -> list[dict[str, object]]:
+        if not hasattr(self, "git_changes_list"):
+            return []
+        entries: list[dict[str, object]] = []
+        seen: set[tuple[str, str, bool, bool, bool]] = set()
+        for item in self.git_changes_list.selectedItems():
+            payload = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(payload, dict):
+                path_value = payload.get("path")
+                status_value = payload.get("status")
+                if not isinstance(path_value, str) or not path_value:
+                    continue
+                status_text = status_value if isinstance(status_value, str) else ""
+                dedupe_key = (
+                    path_value,
+                    status_text,
+                    bool(payload.get("staged")),
+                    bool(payload.get("unstaged")),
+                    bool(payload.get("untracked")),
+                )
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                entries.append(payload)
+        return entries
+
+    def _on_git_change_selection_changed(self) -> None:
+        entries = self._selected_git_entries()
+        if not entries:
+            self.git_diff_view.setPlainText("Diff preview will appear here.")
+            return
+        self._show_git_diff_for_entry(entries[0])
+
+    def _on_git_change_activated(self, _item: QListWidgetItem) -> None:
+        self._git_open_selected_file()
+
+    def _show_git_diff_for_entry(self, entry: dict[str, object]) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            self.git_diff_view.setPlainText("No active repository.")
+            return
+
+        path_value = entry.get("path")
+        if not isinstance(path_value, str) or not path_value:
+            self.git_diff_view.setPlainText("No path for selected entry.")
+            return
+
+        if entry.get("untracked"):
+            absolute_path = os.path.join(repository_path, path_value)
+            if os.path.isdir(absolute_path):
+                self.git_diff_view.setPlainText(f"Untracked directory:\n{path_value}")
+                return
+
+            if os.path.isfile(absolute_path):
+                try:
+                    content = self._read_text_file(absolute_path)
+                except OSError as exc:
+                    self.git_diff_view.setPlainText(f"Could not read untracked file:\n{exc}")
+                    return
+                preview_limit = 20_000
+                preview = content[:preview_limit]
+                if len(content) > preview_limit:
+                    preview += "\n\n... [truncated]"
+                self.git_diff_view.setPlainText(f"Untracked file: {path_value}\n\n{preview}")
+                return
+
+            self.git_diff_view.setPlainText(f"Untracked path:\n{path_value}")
+            return
+
+        ok, stdout_text, stderr_text, _exit_code = self._run_git_command(
+            repository_path,
+            ["--no-pager", "diff", "HEAD", "--", path_value],
+            timeout_seconds=30,
+        )
+        if ok:
+            self.git_diff_view.setPlainText(stdout_text or "No diff output for selected entry.")
+            return
+        self.git_diff_view.setPlainText(stderr_text or "Could not load diff for selected entry.")
+
+    def _git_open_selected_file(self) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            return
+
+        entries = self._selected_git_entries()
+        if not entries:
+            self.statusBar().showMessage("Select a file from Git changes first.", 1800)
+            return
+
+        entry = entries[0]
+        path_value = entry.get("path")
+        if not isinstance(path_value, str) or not path_value:
+            return
+
+        absolute_path = os.path.join(repository_path, path_value)
+        if os.path.isfile(absolute_path):
+            self.open_file(absolute_path)
+            return
+        self.statusBar().showMessage(f"Path is not a file: {path_value}", 2200)
+
+    def _execute_git_command(
+        self,
+        repository_path: str,
+        args: list[str],
+        *,
+        action_label: str,
+        timeout_seconds: int | None = None,
+        show_error_dialog: bool = True,
+    ) -> bool:
+        ok, stdout_text, stderr_text, exit_code = self._run_git_command(
+            repository_path,
+            args,
+            timeout_seconds=timeout_seconds,
+        )
+
+        repo_label = os.path.basename(repository_path.rstrip("\\/")) or repository_path
+        command_text = "git " + " ".join(args)
+        self.log(f"[git:{repo_label}] {command_text}")
+        if stdout_text:
+            for line in stdout_text.splitlines():
+                self.log(f"[git:{repo_label}] {line}")
+        if stderr_text:
+            for line in stderr_text.splitlines():
+                self.log(f"[git:{repo_label}] {line}")
+
+        if ok:
+            self.statusBar().showMessage(f"Git {action_label} completed.", 2500)
+            return True
+
+        error_text = stderr_text or stdout_text or f"Command failed with exit code {exit_code}."
+        self.statusBar().showMessage(f"Git {action_label} failed.", 3500)
+        if show_error_dialog:
+            QMessageBox.warning(
+                self,
+                f"Git {action_label.title()} Failed",
+                error_text,
+            )
+        return False
+
+    def _git_restore_path(self, repository_path: str, path_value: str) -> bool:
+        if self._execute_git_command(
+            repository_path,
+            ["restore", "--source=HEAD", "--staged", "--worktree", "--", path_value],
+            action_label="restore",
+            show_error_dialog=False,
+        ):
+            return True
+        return self._execute_git_command(
+            repository_path,
+            ["checkout", "HEAD", "--", path_value],
+            action_label="restore",
+            show_error_dialog=False,
+        )
+
+    def _git_discard_selected(self) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            return
+
+        entries = self._selected_git_entries()
+        if not entries:
+            self.statusBar().showMessage("Select one or more files to discard changes.", 2200)
+            return
+
+        answer = QMessageBox.warning(
+            self,
+            "Discard Selected Changes",
+            "This will permanently discard selected Git changes.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        success = True
+        for entry in entries:
+            path_value = entry.get("path")
+            if not isinstance(path_value, str) or not path_value:
+                continue
+            if entry.get("untracked"):
+                if not self._execute_git_command(
+                    repository_path,
+                    ["clean", "-fd", "--", path_value],
+                    action_label="discard untracked",
+                    show_error_dialog=False,
+                ):
+                    success = False
+                continue
+
+            if not self._git_restore_path(repository_path, path_value):
+                success = False
+
+        if not success:
+            QMessageBox.warning(self, "Discard Changes", "Some selected changes could not be discarded. See Output.")
+        self._refresh_git_status_panel()
+
+    def _git_reset_hard(self) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            return
+
+        answer = QMessageBox.warning(
+            self,
+            "Git Reset Hard",
+            "This will run `git reset --hard HEAD` and permanently discard local tracked changes.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self._execute_git_command(
+            repository_path,
+            ["reset", "--hard", "HEAD"],
+            action_label="reset hard",
+        )
+        self._refresh_git_status_panel()
+
+    def _git_clean_untracked(self) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            return
+
+        answer = QMessageBox.warning(
+            self,
+            "Clean Untracked",
+            "This will run `git clean -fd` and permanently delete untracked files and directories.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self._execute_git_command(repository_path, ["clean", "-fd"], action_label="clean untracked")
+        self._refresh_git_status_panel()
+
+    def _git_commit_changes(self) -> bool:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            return False
+
+        message = self.git_commit_input.text().strip()
+        if not message:
+            self.statusBar().showMessage("Commit message is empty.", 2200)
+            return False
+
+        has_changes, _change_count = self._git_local_change_summary(repository_path)
+        if not has_changes:
+            self.statusBar().showMessage("No local changes to commit.", 2200)
+            return False
+
+        if not self._execute_git_command(
+            repository_path,
+            ["add", "-A"],
+            action_label="add all",
+        ):
+            self._refresh_git_status_panel()
+            return False
+
+        committed = self._execute_git_command(
+            repository_path,
+            ["commit", "-m", message],
+            action_label="commit",
+        )
+        if committed:
+            self.git_commit_input.clear()
+        self._refresh_git_status_panel()
+        return committed
+
+    def _git_commit_and_push(self) -> None:
+        if not self._git_commit_changes():
+            return
+        self._git_push()
+
+    def _refresh_git_branches(self) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            self.git_branch_combo.clear()
+            return
+
+        ok_current, current_branch_text, _stderr_text, _exit_code = self._run_git_command(
+            repository_path,
+            ["branch", "--show-current"],
+            timeout_seconds=20,
+        )
+        current_branch = current_branch_text.strip() if ok_current else ""
+
+        ok, stdout_text, _stderr_text, _exit_code = self._run_git_command(
+            repository_path,
+            ["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+            timeout_seconds=20,
+        )
+        branches = [line.strip() for line in stdout_text.splitlines() if line.strip()] if ok else []
+        if current_branch and current_branch not in branches:
+            branches.insert(0, current_branch)
+
+        self.git_branch_combo.blockSignals(True)
+        self.git_branch_combo.clear()
+        for branch_name in branches:
+            self.git_branch_combo.addItem(branch_name, branch_name)
+        if current_branch:
+            index = self.git_branch_combo.findData(current_branch)
+            if index >= 0:
+                self.git_branch_combo.setCurrentIndex(index)
+        self.git_branch_combo.blockSignals(False)
+
+    def _git_current_branch(self, repository_path: str) -> str | None:
+        ok, stdout_text, _stderr_text, _exit_code = self._run_git_command(
+            repository_path,
+            ["branch", "--show-current"],
+            timeout_seconds=20,
+        )
+        if not ok:
+            return None
+        branch_name = stdout_text.strip()
+        return branch_name or None
+
+    def _git_upstream_branch(self, repository_path: str) -> str | None:
+        ok, stdout_text, _stderr_text, _exit_code = self._run_git_command(
+            repository_path,
+            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            timeout_seconds=20,
+        )
+        if not ok:
+            return None
+        upstream_branch = stdout_text.strip()
+        return upstream_branch or None
+
+    def _git_default_remote_for_branch(self, repository_path: str, branch_name: str | None) -> str | None:
+        if branch_name:
+            ok, stdout_text, _stderr_text, _exit_code = self._run_git_command(
+                repository_path,
+                ["config", f"branch.{branch_name}.remote"],
+                timeout_seconds=20,
+            )
+            configured_remote = stdout_text.strip() if ok else ""
+            if configured_remote:
+                return configured_remote
+
+        ok, stdout_text, _stderr_text, _exit_code = self._run_git_command(
+            repository_path,
+            ["remote"],
+            timeout_seconds=20,
+        )
+        if not ok:
+            return None
+
+        remotes = [line.strip() for line in stdout_text.splitlines() if line.strip()]
+        if not remotes:
+            return None
+        if "origin" in remotes:
+            return "origin"
+        return remotes[0]
+
+    def _git_local_change_summary(self, repository_path: str) -> tuple[bool, int]:
+        ok, stdout_text, _stderr_text, _exit_code = self._run_git_command(
+            repository_path,
+            ["status", "--porcelain=v1"],
+            timeout_seconds=20,
+        )
+        if not ok:
+            return False, 0
+
+        entries = [line for line in stdout_text.splitlines() if line.strip()]
+        return bool(entries), len(entries)
+
+    def _check_git_remote_updates(self, *, force: bool = False, prompt_for_pull: bool = True) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            return
+
+        repo_key = self._normalize_path(repository_path)
+        now = time.monotonic()
+        if not force:
+            last_checked = self._git_last_remote_check_by_repo.get(repo_key, 0.0)
+            if (now - last_checked) < self._GIT_REMOTE_CHECK_MIN_INTERVAL_SECONDS:
+                return
+        self._git_last_remote_check_by_repo[repo_key] = now
+
+        upstream_branch = self._git_upstream_branch(repository_path)
+        if not upstream_branch:
+            self._git_remote_delta_by_repo.pop(repo_key, None)
+            self._update_git_repo_summary_label()
+            return
+
+        remote_name = upstream_branch.split("/", 1)[0] if "/" in upstream_branch else ""
+        if not remote_name:
+            current_branch = self._git_current_branch(repository_path)
+            resolved_remote = self._git_default_remote_for_branch(repository_path, current_branch)
+            if not resolved_remote:
+                return
+            remote_name = resolved_remote
+
+        fetch_args = ["fetch", "--prune", "--quiet", remote_name]
+        ok_fetch, _stdout_text, stderr_text, _exit_code = self._run_git_command(
+            repository_path,
+            fetch_args,
+            timeout_seconds=self._GIT_REMOTE_CHECK_TIMEOUT_SECONDS,
+        )
+        repo_label = os.path.basename(repository_path.rstrip("\\/")) or repository_path
+        self.log(f"[git:{repo_label}] git {' '.join(fetch_args)}")
+        if stderr_text:
+            for line in stderr_text.splitlines():
+                self.log(f"[git:{repo_label}] {line}")
+        if not ok_fetch:
+            self.statusBar().showMessage("Git remote check failed. See Output for details.", 2800)
+            return
+
+        ok_counts, counts_text, counts_error_text, _exit_code = self._run_git_command(
+            repository_path,
+            ["rev-list", "--left-right", "--count", "HEAD...@{u}"],
+            timeout_seconds=20,
+        )
+        if not ok_counts:
+            if counts_error_text:
+                for line in counts_error_text.splitlines():
+                    self.log(f"[git:{repo_label}] {line}")
+            return
+
+        parts = counts_text.split()
+        if len(parts) < 2:
+            return
+
+        try:
+            ahead_count = int(parts[0])
+            behind_count = int(parts[1])
+        except ValueError:
+            return
+
+        self._git_remote_delta_by_repo[repo_key] = (ahead_count, behind_count)
+        self._update_git_repo_summary_label()
+
+        if behind_count <= 0:
+            self._git_remote_prompted_head_by_repo.pop(repo_key, None)
+            return
+        if not prompt_for_pull:
+            return
+
+        ok_upstream_head, upstream_head_text, _stderr_text, _exit_code = self._run_git_command(
+            repository_path,
+            ["rev-parse", "@{u}"],
+            timeout_seconds=20,
+        )
+        upstream_head = upstream_head_text.strip() if ok_upstream_head and upstream_head_text.strip() else upstream_branch
+        if self._git_remote_prompted_head_by_repo.get(repo_key) == upstream_head:
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Remote Updates Available",
+            f"Remote has {behind_count} new commit(s) on {upstream_branch}.\n\nPull now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._git_pull()
+            self._check_git_remote_updates(force=True, prompt_for_pull=False)
+            return
+        self._git_remote_prompted_head_by_repo[repo_key] = upstream_head
+
+    def _refresh_after_git_worktree_change(self) -> None:
+        self._refresh_workspace_tree_after_external_change()
+
+        open_paths: list[str] = []
+        for tabs in self._all_tab_widgets():
+            for index in range(tabs.count()):
+                widget = self._tab_widget_at(tabs, index)
+                if widget is None:
+                    continue
+                file_path = self._widget_file_path(widget)
+                if not file_path:
+                    continue
+                open_paths.append(file_path)
+
+        for file_path in open_paths:
+            self._handle_external_file_change(file_path, source="poll")
+
+        # Re-sync watcher/signature state after applying in-editor reloads.
+        self._sync_file_watcher_paths()
+
+    def _git_checkout_selected_branch(self) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            return
+        branch_value = self.git_branch_combo.currentData()
+        if not isinstance(branch_value, str) or not branch_value.strip():
+            self.statusBar().showMessage("Select a branch to checkout.", 2200)
+            return
+        self._execute_git_command(
+            repository_path,
+            ["checkout", branch_value.strip()],
+            action_label="checkout",
+        )
+        self._refresh_after_git_worktree_change()
+        self._refresh_git_status_panel()
+
+    def _git_create_and_checkout_branch(self) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            return
+
+        branch_name = self.git_new_branch_input.text().strip()
+        if not branch_name:
+            self.statusBar().showMessage("Enter a new branch name first.", 2200)
+            return
+
+        if self._execute_git_command(
+            repository_path,
+            ["checkout", "-b", branch_name],
+            action_label="create branch",
+        ):
+            self.git_new_branch_input.clear()
+            self._refresh_after_git_worktree_change()
+        self._refresh_git_status_panel()
+
+    def _git_pull(self) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            return
+
+        branch_name = self._git_current_branch(repository_path)
+        upstream_branch = self._git_upstream_branch(repository_path)
+        if upstream_branch:
+            pull_args = ["pull", "--ff-only"]
+        else:
+            if not branch_name:
+                QMessageBox.warning(
+                    self,
+                    "Git Pull",
+                    "Cannot pull in detached HEAD state without an explicit branch.",
+                )
+                return
+            remote_name = self._git_default_remote_for_branch(repository_path, branch_name)
+            if not remote_name:
+                QMessageBox.warning(
+                    self,
+                    "Git Pull",
+                    "No remote configured for this repository.",
+                )
+                return
+            pull_args = ["pull", "--ff-only", remote_name, branch_name]
+
+        pull_ok = self._execute_git_command(
+            repository_path,
+            pull_args,
+            action_label="pull",
+            timeout_seconds=300,
+            show_error_dialog=False,
+        )
+        if not pull_ok:
+            fallback_answer = QMessageBox.question(
+                self,
+                "Pull Failed",
+                "Fast-forward pull failed. Try `git pull --rebase` instead?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if fallback_answer == QMessageBox.StandardButton.Yes:
+                pull_ok = self._execute_git_command(
+                    repository_path,
+                    ["pull", "--rebase"],
+                    action_label="pull --rebase",
+                    timeout_seconds=300,
+                )
+
+        if pull_ok:
+            self._refresh_after_git_worktree_change()
+        self._refresh_git_status_panel()
+
+    def _git_push(self) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            return
+
+        has_local_changes, local_change_count = self._git_local_change_summary(repository_path)
+        if has_local_changes:
+            commit_message = self.git_commit_input.text().strip() if hasattr(self, "git_commit_input") else ""
+            if commit_message:
+                answer = QMessageBox.question(
+                    self,
+                    "Commit Local Changes",
+                    (
+                        f"You have {local_change_count} local change(s).\n\n"
+                        "Commit all local changes with the current message, then push?"
+                    ),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if answer == QMessageBox.StandardButton.Cancel:
+                    return
+                if answer == QMessageBox.StandardButton.Yes and not self._git_commit_changes():
+                    return
+            else:
+                answer = QMessageBox.question(
+                    self,
+                    "Push With Local Changes",
+                    (
+                        f"You have {local_change_count} local change(s) that are not committed.\n"
+                        "These local changes will not be pushed.\n\n"
+                        "Continue pushing existing commits?"
+                    ),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+
+        branch_name = self._git_current_branch(repository_path)
+        if not branch_name:
+            QMessageBox.warning(
+                self,
+                "Git Push",
+                "Cannot push in detached HEAD state.",
+            )
+            return
+
+        upstream_branch = self._git_upstream_branch(repository_path)
+        if upstream_branch:
+            push_args = ["push"]
+            action_label = "push"
+        else:
+            remote_name = self._git_default_remote_for_branch(repository_path, branch_name)
+            if not remote_name:
+                QMessageBox.warning(
+                    self,
+                    "Git Push",
+                    "No remote configured for this repository.",
+                )
+                return
+            push_args = ["push", "-u", remote_name, branch_name]
+            action_label = f"push -u {remote_name} {branch_name}"
+
+        self._execute_git_command(
+            repository_path,
+            push_args,
+            action_label=action_label,
+            timeout_seconds=300,
+        )
+        self._refresh_git_status_panel()
+
+    def _git_sync(self) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            return
+
+        branch_name = self._git_current_branch(repository_path)
+        if not branch_name:
+            QMessageBox.warning(
+                self,
+                "Git Sync",
+                "Cannot sync in detached HEAD state.",
+            )
+            self._refresh_git_status_panel()
+            return
+
+        upstream_branch = self._git_upstream_branch(repository_path)
+        if upstream_branch:
+            pull_ok = self._execute_git_command(
+                repository_path,
+                ["pull", "--ff-only"],
+                action_label="sync(pull)",
+                timeout_seconds=300,
+                show_error_dialog=False,
+            )
+            if not pull_ok:
+                fallback_answer = QMessageBox.question(
+                    self,
+                    "Sync Pull Failed",
+                    "Fast-forward pull failed during sync. Try `git pull --rebase`?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if fallback_answer == QMessageBox.StandardButton.Yes:
+                    pull_ok = self._execute_git_command(
+                        repository_path,
+                        ["pull", "--rebase"],
+                        action_label="sync(pull --rebase)",
+                        timeout_seconds=300,
+                    )
+            if not pull_ok:
+                self._refresh_git_status_panel()
+                return
+
+            self._refresh_after_git_worktree_change()
+            self._execute_git_command(
+                repository_path,
+                ["push"],
+                action_label="sync(push)",
+                timeout_seconds=300,
+            )
+        else:
+            remote_name = self._git_default_remote_for_branch(repository_path, branch_name)
+            if not remote_name:
+                QMessageBox.warning(
+                    self,
+                    "Git Sync",
+                    "No remote configured for this repository.",
+                )
+                self._refresh_git_status_panel()
+                return
+            self._execute_git_command(
+                repository_path,
+                ["push", "-u", remote_name, branch_name],
+                action_label=f"sync(push -u {remote_name} {branch_name})",
+                timeout_seconds=300,
+            )
+            self._refresh_after_git_worktree_change()
+        self._refresh_git_status_panel()
+
+    def _refresh_git_log(self) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            self.git_log_list.clear()
+            return
+
+        ok, stdout_text, stderr_text, _exit_code = self._run_git_command(
+            repository_path,
+            [
+                "--no-pager",
+                "log",
+                f"-n{self._GIT_LOG_MAX_ENTRIES}",
+                "--date=short",
+                "--pretty=format:%h\t%ad\t%s\t%d",
+            ],
+            timeout_seconds=30,
+        )
+        self.git_log_list.clear()
+        if not ok:
+            message = stderr_text or "Could not load git log."
+            self.git_log_list.addItem(message)
+            return
+
+        lines = [line for line in stdout_text.splitlines() if line.strip()]
+        for line in lines:
+            parts = line.split("\t", 3)
+            if len(parts) < 3:
+                item = QListWidgetItem(line)
+                self.git_log_list.addItem(item)
+                continue
+            commit_hash = parts[0].strip()
+            commit_date = parts[1].strip()
+            subject = parts[2].strip()
+            decoration = parts[3].strip() if len(parts) > 3 else ""
+            text = f"{commit_hash}  {commit_date}  {subject}"
+            if decoration:
+                text = f"{text}  {decoration}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, commit_hash)
+            item.setToolTip(text)
+            self.git_log_list.addItem(item)
+
+    def _on_git_log_activated(self, item: QListWidgetItem) -> None:
+        repository_path = self._active_git_repository()
+        if not repository_path:
+            return
+
+        commit_hash = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(commit_hash, str) or not commit_hash:
+            return
+
+        ok, stdout_text, stderr_text, _exit_code = self._run_git_command(
+            repository_path,
+            ["--no-pager", "show", "--stat", "--patch", "--color=never", commit_hash],
+            timeout_seconds=40,
+        )
+        if ok:
+            self.git_diff_view.setPlainText(stdout_text or f"No details for commit {commit_hash}.")
+            return
+        self.git_diff_view.setPlainText(stderr_text or f"Could not load commit {commit_hash}.")
+
+    def _refresh_git_after_path_change(self, *, rescan_repositories: bool = False) -> None:
+        if not hasattr(self, "git_repo_combo"):
+            return
+        if rescan_repositories:
+            self._refresh_git_repositories()
+            return
+        if self._solution_nav_panel == "git" and self._active_git_repository():
+            self._refresh_git_status_panel()
+
     def _update_solution_explorer_surface(self) -> None:
         if not hasattr(self, "solution_explorer_stack"):
             return
@@ -1365,6 +2799,8 @@ class MainWindow(QMainWindow):
         self.solution_explorer_toggle_action.blockSignals(True)
         self.solution_explorer_toggle_action.setChecked(is_visible)
         self.solution_explorer_toggle_action.blockSignals(False)
+        if is_visible and self._solution_nav_panel == "git":
+            self._refresh_git_repositories()
 
     def _on_terminal_dock_visibility_changed(self, is_visible: bool) -> None:
         self.terminal_toggle_action.blockSignals(True)
@@ -1513,6 +2949,7 @@ class MainWindow(QMainWindow):
         self._refresh_breadcrumbs(None)
         self._update_solution_explorer_surface()
         self._update_editor_surface()
+        self._refresh_git_repositories(preserve_selection=False)
 
         if closed_workspace:
             self.log(f"[workspace] Closed folder: {closed_workspace}")
@@ -1541,6 +2978,7 @@ class MainWindow(QMainWindow):
         self._refresh_breadcrumbs()
         self._update_solution_explorer_surface()
         self._update_editor_surface()
+        self._refresh_git_repositories(preserve_selection=False)
 
     def _show_tree_context_menu(self, pos: QPoint) -> None:
         if not self.workspace_root:
@@ -1660,6 +3098,7 @@ class MainWindow(QMainWindow):
                 pass
             self.log(f"[file] Created file: {full_path}")
             self._reveal_path(full_path)
+            self._refresh_git_after_path_change()
             return full_path
         except OSError as exc:
             self._show_error("Create File", full_path, exc)
@@ -1683,6 +3122,7 @@ class MainWindow(QMainWindow):
             os.mkdir(full_path)
             self.log(f"[file] Created folder: {full_path}")
             self._reveal_path(full_path)
+            self._refresh_git_after_path_change(rescan_repositories=True)
             return full_path
         except OSError as exc:
             self._show_error("Create Folder", full_path, exc)
@@ -1712,6 +3152,7 @@ class MainWindow(QMainWindow):
             self.log(f"[file] Renamed: {old_path} -> {new_path}")
             self._update_open_tabs_after_rename(old_path, new_path)
             self._reveal_path(new_path)
+            self._refresh_git_after_path_change(rescan_repositories=True)
         except OSError as exc:
             self._show_error("Rename", old_path, exc)
 
@@ -1738,6 +3179,7 @@ class MainWindow(QMainWindow):
                 os.remove(target_path)
             self.log(f"[file] Deleted {label}: {target_path}")
             self._close_tabs_for_deleted_path(target_path)
+            self._refresh_git_after_path_change(rescan_repositories=True)
         except OSError as exc:
             self._show_error("Delete", target_path, exc)
 
@@ -2121,6 +3563,7 @@ class MainWindow(QMainWindow):
         self.log(f"[editor] Saved file: {absolute_target}")
         if large_file_mode:
             self.log(f"[editor] Large File Mode active ({large_file_reason})")
+        self._refresh_git_after_path_change()
         return True
 
     def _create_editor_widget(
@@ -2862,6 +4305,7 @@ class MainWindow(QMainWindow):
 
         if changed_files > 0:
             self._sync_file_watcher_paths()
+            self._refresh_git_after_path_change()
         return changed_files, changed_edits
 
     def _collect_workspace_edit_changes(self, workspace_edit: dict[str, object]) -> dict[str, list[dict[str, object]]]:
@@ -4245,8 +5689,6 @@ class MainWindow(QMainWindow):
         absolute_changed = os.path.abspath(changed_path)
         if self.workspace_root and self._paths_equal(absolute_changed, self.workspace_root):
             self._refresh_workspace_tree_after_external_change()
-            self.log(f"[watcher] Workspace updated externally: {absolute_changed}")
-            self.statusBar().showMessage("Workspace tree refreshed from external changes.", 1800)
         self._sync_file_watcher_paths()
 
     def _on_watched_file_changed(self, changed_path: str) -> None:
@@ -4350,6 +5792,7 @@ class MainWindow(QMainWindow):
         self._record_file_disk_state(absolute_path)
         self.statusBar().showMessage(f"Reloaded {absolute_path} ({reason}).", 2500)
         self.log(f"[watcher] Reloaded image from disk: {absolute_path} ({reason}).")
+        self._refresh_git_after_path_change()
         return True
 
     def _reload_editor_from_disk(self, editor: CodeEditor, reason: str) -> bool:
@@ -4393,6 +5836,7 @@ class MainWindow(QMainWindow):
         self._record_file_disk_state(absolute_path)
         self.statusBar().showMessage(f"Reloaded {absolute_path} ({reason}).", 2500)
         self.log(f"[watcher] Reloaded file from disk: {absolute_path} ({reason}).")
+        self._refresh_git_after_path_change()
         return True
 
     def _request_close_tab(self, tabs: QTabWidget, tab_index: int) -> None:
@@ -4647,6 +6091,7 @@ class MainWindow(QMainWindow):
         if widget is self._current_tab_widget():
             self._update_editor_mode_status(widget)
             self._refresh_breadcrumbs(widget)
+        self._refresh_git_after_path_change(rescan_repositories=True)
 
     def _close_tabs_for_deleted_path(self, deleted_path: str) -> None:
         for tabs in self._all_tab_widgets():

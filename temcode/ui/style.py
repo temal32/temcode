@@ -522,6 +522,7 @@ QFrame#solutionNavBar {{
 
 QToolButton#solutionNavExplorerButton,
 QToolButton#solutionNavSearchButton,
+QToolButton#solutionNavGitButton,
 QToolButton#solutionNavSettingsButton {{
     background: transparent;
     border: 1px solid transparent;
@@ -531,14 +532,108 @@ QToolButton#solutionNavSettingsButton {{
 
 QToolButton#solutionNavExplorerButton:hover,
 QToolButton#solutionNavSearchButton:hover,
+QToolButton#solutionNavGitButton:hover,
 QToolButton#solutionNavSettingsButton:hover {{
     background: {colors["button_hover_bg"]};
 }}
 
 QToolButton#solutionNavExplorerButton:checked,
+QToolButton#solutionNavGitButton:checked,
 QToolButton#solutionNavSearchButton:checked {{
     background: {colors["button_bg"]};
     border-color: {colors["button_border"]};
+}}
+
+QWidget#solutionGitPage {{
+    background: {colors["widget_bg"]};
+}}
+
+QLabel#gitSectionTitle {{
+    font-size: {pt(10)};
+    font-weight: 700;
+    letter-spacing: 0.2px;
+    padding: 1px 0 1px 1px;
+}}
+
+QWidget#solutionGitPage QComboBox#gitRepoCombo,
+QWidget#solutionGitPage QComboBox#gitBranchCombo,
+QWidget#solutionGitPage QLineEdit#gitNewBranchInput,
+QWidget#solutionGitPage QLineEdit#gitCommitInput {{
+    background: {colors["editor_bg"]};
+    border: 1px solid {colors["button_border"]};
+    border-radius: 4px;
+    padding: 4px 7px;
+}}
+
+QWidget#solutionGitPage QLineEdit#gitCommitInput {{
+    min-height: 24px;
+}}
+
+QWidget#solutionGitPage QPushButton {{
+    background: {colors["button_bg"]};
+    border: 1px solid {colors["button_border"]};
+    border-radius: 4px;
+    padding: 4px 10px;
+    min-height: 22px;
+}}
+
+QWidget#solutionGitPage QPushButton:hover {{
+    background: {colors["button_hover_bg"]};
+}}
+
+QWidget#solutionGitPage QPushButton:disabled {{
+    color: {colors["placeholder_fg"]};
+}}
+
+QToolButton#gitCommitSplitButton {{
+    background: {colors["selection_bg"]};
+    color: {colors["selection_fg"]};
+    border: 1px solid {colors["selection_bg"]};
+    border-radius: 4px;
+    padding: 4px 14px;
+    min-height: 24px;
+    font-weight: 600;
+}}
+
+QToolButton#gitCommitSplitButton:hover {{
+    border-color: {colors["button_border"]};
+}}
+
+QToolButton#gitCommitSplitButton:pressed {{
+    background: {colors["button_hover_bg"]};
+    color: {colors["selection_fg"]};
+}}
+
+QToolButton#gitCommitSplitButton:disabled {{
+    background: {colors["button_bg"]};
+    border-color: {colors["button_border"]};
+    color: {colors["placeholder_fg"]};
+}}
+
+QToolButton#gitCommitSplitButton::menu-button {{
+    border-left: 1px solid {colors["button_border"]};
+    width: 18px;
+    padding: 0 2px;
+}}
+
+QListWidget#gitChangesList,
+QListWidget#gitLogList {{
+    background: {colors["editor_bg"]};
+    border: 1px solid {colors["editor_border"]};
+    border-radius: 4px;
+    padding: 2px;
+}}
+
+QListWidget#gitChangesList::item,
+QListWidget#gitLogList::item {{
+    padding: 4px 6px;
+    border-radius: 3px;
+}}
+
+QListWidget#gitChangesList::item:selected,
+QListWidget#gitLogList::item:selected {{
+    background: {colors["selection_bg"]};
+    color: {colors["selection_fg"]};
 }}
 
 QLabel#breadcrumbSegment {{
