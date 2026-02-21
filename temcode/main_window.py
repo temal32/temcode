@@ -10,7 +10,7 @@ import time
 import webbrowser
 from datetime import datetime
 
-from PySide6.QtCore import QDir, QFileSystemWatcher, QModelIndex, QPoint, Qt, QTimer
+from PySide6.QtCore import QDir, QEvent, QFileSystemWatcher, QModelIndex, QPoint, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QColor, QCloseEvent, QKeySequence, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -88,6 +88,8 @@ class MainWindow(QMainWindow):
     _TAB_CLOSE_BUTTON_BASE_HEIGHT = 20
     _MIN_WINDOW_WIDTH = 640
     _MIN_WINDOW_HEIGHT = 420
+    _MIN_TERMINAL_DOCK_HEIGHT = 80
+    _UI_SETTINGS_PERSIST_DEBOUNCE_MS = 250
     _GITHUB_REPO_URL = "https://github.com/temal32/temcode"
     _LSP_DID_CHANGE_DEBOUNCE_MS = 180
     _LSP_MAX_COMPLETION_ITEMS = 40
@@ -124,12 +126,17 @@ class MainWindow(QMainWindow):
         self._recent_paths: list[str] = []
         self._bottom_layout_mode = self._BOTTOM_LAYOUT_STACKED
         self._suspend_ui_settings_persistence = False
+        self._settings_persistence_splitter_ids: set[int] = set()
         self._is_app_closing = False
         self._start_maximized = True
         self._startup_window_mode_loaded = False
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(False)
         self._autosave_timer.timeout.connect(self._run_autosave_cycle)
+        self._ui_settings_persist_timer = QTimer(self)
+        self._ui_settings_persist_timer.setSingleShot(True)
+        self._ui_settings_persist_timer.setInterval(self._UI_SETTINGS_PERSIST_DEBOUNCE_MS)
+        self._ui_settings_persist_timer.timeout.connect(self._persist_ui_settings)
         self._file_watcher = QFileSystemWatcher(self)
         self._file_watcher.fileChanged.connect(self._on_watched_file_changed)
         self._file_watcher.directoryChanged.connect(self._on_watched_directory_changed)
@@ -156,6 +163,8 @@ class MainWindow(QMainWindow):
         self._build_solution_explorer_dock()
         self._build_output_dock()
         self._build_terminal_dock()
+        self._connect_splitter_move_persistence_hooks()
+        self.installEventFilter(self)
         self._lsp_client.ready_changed.connect(self._on_lsp_ready_changed)
         self._lsp_client.diagnostics_published.connect(self._on_lsp_diagnostics_published)
         self._lsp_client.log_message.connect(lambda message: self.log(f"[lsp] {message}"))
@@ -862,6 +871,7 @@ class MainWindow(QMainWindow):
         self.output_panel.setReadOnly(True)
         self.output_panel.setObjectName("outputPanel")
         self.output_panel.setPlainText("Temcode output panel initialized.")
+        self.output_panel.installEventFilter(self)
 
         self.output_dock.setWidget(self.output_panel)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.output_dock)
@@ -869,6 +879,7 @@ class MainWindow(QMainWindow):
         self.output_toggle_action.setChecked(True)
         self.output_toggle_action.toggled.connect(self.output_dock.setVisible)
         self.output_dock.visibilityChanged.connect(self._on_output_dock_visibility_changed)
+        self.output_dock.installEventFilter(self)
 
     def _build_terminal_dock(self) -> None:
         self.terminal_dock = QDockWidget("Terminal", self)
@@ -883,6 +894,7 @@ class MainWindow(QMainWindow):
         terminal_layout.setSpacing(6)
 
         self.terminal_console = CmdTerminalWidget(terminal_container)
+        self.terminal_console.installEventFilter(self)
         self.terminal_console.session_started.connect(
             lambda cwd: self.log(f"[terminal] Started cmd.exe in {cwd}")
         )
@@ -902,6 +914,8 @@ class MainWindow(QMainWindow):
         self.terminal_toggle_action.setChecked(True)
         self.terminal_toggle_action.toggled.connect(self.terminal_dock.setVisible)
         self.terminal_dock.visibilityChanged.connect(self._on_terminal_dock_visibility_changed)
+        self.terminal_dock.installEventFilter(self)
+        terminal_container.installEventFilter(self)
 
     def _set_bottom_dock_layout(self, layout_mode: str, persist: bool = True) -> None:
         if layout_mode not in {self._BOTTOM_LAYOUT_STACKED, self._BOTTOM_LAYOUT_SIDE_BY_SIDE}:
@@ -920,6 +934,7 @@ class MainWindow(QMainWindow):
 
         self.splitDockWidget(self.output_dock, self.terminal_dock, orientation)
         self.resizeDocks([self.output_dock, self.terminal_dock], [1, 1], orientation)
+        self._connect_splitter_move_persistence_hooks()
         if persist:
             self._persist_ui_settings()
         self.log(f"[layout] Bottom panels set to {layout_label}.")
@@ -942,6 +957,41 @@ class MainWindow(QMainWindow):
         self.terminal_toggle_action.blockSignals(False)
         if not self._suspend_ui_settings_persistence and not self._is_app_closing:
             self._persist_ui_settings()
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:  # noqa: N802 (Qt API)
+        if hasattr(self, "output_dock") and hasattr(self, "terminal_dock"):
+            watch_targets = (
+                self,
+                self.output_dock,
+                self.terminal_dock,
+                self.output_dock.widget(),
+                self.terminal_dock.widget(),
+                self.terminal_console,
+            )
+            watch_event_types = {
+                QEvent.Type.Resize,
+                QEvent.Type.LayoutRequest,
+                QEvent.Type.Show,
+                QEvent.Type.Hide,
+            }
+            if any(watched is target for target in watch_targets if target is not None) and event.type() in watch_event_types:
+                self._schedule_ui_settings_persistence()
+        return super().eventFilter(watched, event)
+
+    def _schedule_ui_settings_persistence(self) -> None:
+        if self._suspend_ui_settings_persistence or self._is_app_closing:
+            return
+        self._ui_settings_persist_timer.start()
+
+    def _connect_splitter_move_persistence_hooks(self) -> None:
+        for splitter in self.findChildren(QSplitter):
+            splitter_id = id(splitter)
+            if splitter_id in self._settings_persistence_splitter_ids:
+                continue
+            splitter.splitterMoved.connect(
+                lambda _position, _index: self._schedule_ui_settings_persistence()
+            )
+            self._settings_persistence_splitter_ids.add(splitter_id)
 
     def open_file_dialog(self) -> None:
         start_dir = self.workspace_root or os.getcwd()
@@ -2959,6 +3009,7 @@ class MainWindow(QMainWindow):
                 "bottom_panel_layout": self._BOTTOM_LAYOUT_STACKED,
                 "output_enabled": True,
                 "terminal_enabled": True,
+                "terminal_height": None,
                 "window": {
                     "use_last_size": False,
                 },
@@ -3131,6 +3182,70 @@ class MainWindow(QMainWindow):
 
         return output_enabled, terminal_enabled
 
+    def _normalize_terminal_height(self, value: object) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed_height = int(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed_height <= 0:
+            return None
+        return max(self._MIN_TERMINAL_DOCK_HEIGHT, parsed_height)
+
+    def _current_terminal_height(self) -> int | None:
+        if not hasattr(self, "terminal_dock"):
+            return None
+        if not self.terminal_dock.isVisible():
+            return None
+        return self._normalize_terminal_height(self.terminal_dock.height())
+
+    def _parse_terminal_height_setting(self, payload: object) -> int | None:
+        if not isinstance(payload, dict):
+            return None
+
+        ui_payload = payload.get("ui")
+        if not isinstance(ui_payload, dict):
+            return None
+
+        terminal_height_value = ui_payload.get("terminal_height")
+        if terminal_height_value is None:
+            return None
+
+        parsed_terminal_height = self._normalize_terminal_height(terminal_height_value)
+        if parsed_terminal_height is None:
+            self.log("[settings] Invalid ui.terminal_height; using automatic terminal panel size.")
+        return parsed_terminal_height
+
+    def _apply_terminal_height_setting(self, terminal_height: int | None) -> None:
+        if terminal_height is None:
+            return
+        if not self.output_dock.isVisible() or not self.terminal_dock.isVisible():
+            return
+
+        normalized_terminal_height = self._normalize_terminal_height(terminal_height)
+        if normalized_terminal_height is None:
+            return
+
+        if self._bottom_layout_mode == self._BOTTOM_LAYOUT_STACKED:
+            total_bottom_height = int(self.output_dock.height()) + int(self.terminal_dock.height())
+            if total_bottom_height <= 1:
+                return
+            normalized_terminal_height = max(1, min(normalized_terminal_height, total_bottom_height - 1))
+            output_height = max(1, total_bottom_height - normalized_terminal_height)
+            self.resizeDocks(
+                [self.output_dock, self.terminal_dock],
+                [output_height, normalized_terminal_height],
+                Qt.Orientation.Vertical,
+            )
+            return
+
+        self.resizeDocks(
+            [self.output_dock, self.terminal_dock],
+            [normalized_terminal_height, normalized_terminal_height],
+            Qt.Orientation.Vertical,
+        )
+
     def _parse_window_size_setting(self, payload: object) -> tuple[int, int] | None:
         if not isinstance(payload, dict):
             return None
@@ -3238,6 +3353,9 @@ class MainWindow(QMainWindow):
         ui_payload["bottom_panel_layout"] = self._bottom_layout_mode
         ui_payload["output_enabled"] = self.output_dock.isVisible()
         ui_payload["terminal_enabled"] = self.terminal_dock.isVisible()
+        ui_payload["terminal_height"] = (
+            self._current_terminal_height() or self._normalize_terminal_height(ui_payload.get("terminal_height"))
+        )
 
         current_width = max(self._MIN_WINDOW_WIDTH, int(self.width()))
         current_height = max(self._MIN_WINDOW_HEIGHT, int(self.height()))
@@ -3315,6 +3433,9 @@ class MainWindow(QMainWindow):
         ui_payload["bottom_panel_layout"] = self._bottom_layout_mode
         ui_payload["output_enabled"] = self.output_dock.isVisible()
         ui_payload["terminal_enabled"] = self.terminal_dock.isVisible()
+        ui_payload["terminal_height"] = (
+            self._current_terminal_height() or self._normalize_terminal_height(ui_payload.get("terminal_height"))
+        )
         window_payload = ui_payload.get("window")
         if not isinstance(window_payload, dict):
             window_payload = {}
@@ -3382,6 +3503,7 @@ class MainWindow(QMainWindow):
         self._ui_zoom_percent = self._parse_ui_zoom_setting(payload)
         self._code_zoom_point_size = self._parse_code_zoom_setting(payload)
         self._python_interpreter_path = self._parse_python_interpreter_setting(payload)
+        saved_terminal_height = self._parse_terminal_height_setting(payload)
         self._apply_theme(self._parse_theme_setting(payload))
         self._apply_code_zoom_to_open_editors()
         self._update_ui_zoom_actions()
@@ -3396,6 +3518,7 @@ class MainWindow(QMainWindow):
         self._apply_bottom_layout_setting(self._parse_bottom_layout_setting(payload))
         output_enabled, terminal_enabled = self._parse_bottom_panel_visibility_settings(payload)
         self._apply_bottom_panel_visibility_settings(output_enabled, terminal_enabled)
+        QTimer.singleShot(0, lambda height=saved_terminal_height: self._apply_terminal_height_setting(height))
         self._autosave_last_summary = ""
         self._configure_autosave_timer()
 
@@ -4180,6 +4303,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 (Qt API)
         self._is_app_closing = True
         self._autosave_timer.stop()
+        self._ui_settings_persist_timer.stop()
         self._file_poll_timer.stop()
         if self.terminal_console is not None and not self.terminal_console.shutdown(timeout_ms=2500):
             QMessageBox.warning(
