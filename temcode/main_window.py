@@ -118,6 +118,7 @@ class MainWindow(QMainWindow):
         self._theme_id = self._DEFAULT_THEME_ID
         self._ui_zoom_percent = self._DEFAULT_UI_ZOOM_PERCENT
         self._code_zoom_point_size: float | None = None
+        self._python_interpreter_path: str | None = None
         self._settings_file_path: str | None = None
         self._recent_paths_file_path: str | None = None
         self._recent_paths: list[str] = []
@@ -591,7 +592,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_breadcrumbs(self, widget: QWidget | None = None) -> None:
         target_widget = widget if widget is not None else self._current_tab_widget()
-        self._render_breadcrumbs(self._breadcrumb_segments_for_widget(target_widget))
+        self._render_breadcrumbs(self._breadcrumb_segments_for_widget(target_widget), target_widget)
 
     def _breadcrumb_segments_for_widget(self, widget: QWidget | None) -> list[str]:
         if widget is None:
@@ -616,12 +617,12 @@ class MainWindow(QMainWindow):
         root_segment = f"{drive}\\" if drive else os.sep
         return ["Workspace", "(external)", root_segment, *tail_parts]
 
-    def _render_breadcrumbs(self, segments: list[str]) -> None:
+    def _render_breadcrumbs(self, segments: list[str], target_widget: QWidget | None = None) -> None:
         while self.breadcrumbs_layout.count():
             item = self.breadcrumbs_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
+            item_widget = item.widget()
+            if item_widget is not None:
+                item_widget.deleteLater()
 
         cleaned_segments = [segment for segment in segments if segment]
         if not cleaned_segments:
@@ -639,6 +640,100 @@ class MainWindow(QMainWindow):
             self.breadcrumbs_layout.addWidget(label)
 
         self.breadcrumbs_layout.addStretch(1)
+        self._add_python_run_button(target_widget)
+
+    @staticmethod
+    def _is_python_source_path(file_path: str | None) -> bool:
+        if not file_path:
+            return False
+        return os.path.splitext(file_path)[1].lower() == ".py"
+
+    def _python_file_path_for_widget(self, widget: QWidget | None) -> str | None:
+        if not isinstance(widget, CodeEditor):
+            return None
+        file_path = self._editor_file_path(widget)
+        if not self._is_python_source_path(file_path):
+            return None
+        return os.path.abspath(file_path)
+
+    def _normalized_python_interpreter(self) -> str | None:
+        raw_value = self._python_interpreter_path
+        if not isinstance(raw_value, str):
+            return None
+        normalized = raw_value.strip()
+        return normalized or None
+
+    def _add_python_run_button(self, widget: QWidget | None) -> None:
+        python_file_path = self._python_file_path_for_widget(widget)
+        if not python_file_path:
+            return
+
+        run_button = QPushButton(self.breadcrumbs_bar)
+        run_button.setObjectName("pythonRunButton")
+        run_button.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        interpreter = self._normalized_python_interpreter()
+        if interpreter:
+            run_button.setText("Run")
+            run_button.setToolTip(f"Run {os.path.basename(python_file_path)}")
+            run_button.clicked.connect(self._run_current_python_file)
+        else:
+            run_button.setText("Set Python Interpreter in Settings First")
+            run_button.setToolTip("Set python.interpreter in Settings before running files.")
+            run_button.clicked.connect(self._open_settings_for_python_interpreter)
+
+        self.breadcrumbs_layout.addWidget(run_button)
+
+    def _open_settings_for_python_interpreter(self) -> None:
+        self.statusBar().showMessage("Set a Python interpreter in Settings first.", 3000)
+        self.open_settings_dialog()
+
+    def _run_current_python_file(self) -> None:
+        current_widget = self._current_tab_widget()
+        python_file_path = self._python_file_path_for_widget(current_widget)
+        if not python_file_path:
+            return
+
+        interpreter = self._normalized_python_interpreter()
+        if not interpreter:
+            self._open_settings_for_python_interpreter()
+            return
+
+        if isinstance(current_widget, CodeEditor) and current_widget.document().isModified():
+            answer = QMessageBox.question(
+                self,
+                "Run Python File",
+                f"Save changes before running?\n{python_file_path}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Cancel:
+                return
+            if answer == QMessageBox.StandardButton.Yes and not self._save_editor(current_widget, save_as=False):
+                return
+
+        if self.terminal_console is None:
+            QMessageBox.warning(self, "Run Python File", "Terminal is not available.")
+            return
+
+        working_directory = os.path.dirname(python_file_path)
+        if working_directory and os.path.isdir(working_directory):
+            self.terminal_console.set_working_directory(working_directory)
+
+        self.terminal_dock.show()
+        self.terminal_dock.raise_()
+        self.terminal_toggle_action.blockSignals(True)
+        self.terminal_toggle_action.setChecked(True)
+        self.terminal_toggle_action.blockSignals(False)
+
+        command = subprocess.list2cmdline([interpreter, python_file_path])
+        if not self.terminal_console.execute_command(command):
+            self.statusBar().showMessage("Failed to run Python file in terminal.", 3000)
+            self.log(f"[run] Failed to execute command: {command}")
+            return
+
+        self.statusBar().showMessage(f"Running {os.path.basename(python_file_path)}...", 2500)
+        self.log(f"[run] {command}")
 
     def _create_editor_tabs(self, object_name: str) -> QTabWidget:
         tabs = QTabWidget(self)
@@ -744,7 +839,7 @@ class MainWindow(QMainWindow):
         self.solution_explorer_toggle_action.setCheckable(True)
         self.solution_explorer_toggle_action.setChecked(True)
         self.solution_explorer_toggle_action.toggled.connect(self.solution_explorer_dock.setVisible)
-        self.solution_explorer_dock.visibilityChanged.connect(self.solution_explorer_toggle_action.setChecked)
+        self.solution_explorer_dock.visibilityChanged.connect(self._on_solution_explorer_dock_visibility_changed)
         self._update_solution_explorer_surface()
 
     def _update_solution_explorer_surface(self) -> None:
@@ -835,6 +930,11 @@ class MainWindow(QMainWindow):
         self.output_toggle_action.blockSignals(False)
         if not self._suspend_ui_settings_persistence and not self._is_app_closing:
             self._persist_ui_settings()
+
+    def _on_solution_explorer_dock_visibility_changed(self, is_visible: bool) -> None:
+        self.solution_explorer_toggle_action.blockSignals(True)
+        self.solution_explorer_toggle_action.setChecked(is_visible)
+        self.solution_explorer_toggle_action.blockSignals(False)
 
     def _on_terminal_dock_visibility_changed(self, is_visible: bool) -> None:
         self.terminal_toggle_action.blockSignals(True)
@@ -2507,6 +2607,9 @@ class MainWindow(QMainWindow):
             self._MIN_WINDOW_HEIGHT,
             max(self._MIN_WINDOW_HEIGHT, int(self.height())),
         )
+        initial_python_interpreter = self._parse_python_interpreter_setting(payload) or (
+            self._python_interpreter_path or ""
+        )
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Settings")
@@ -2659,6 +2762,58 @@ class MainWindow(QMainWindow):
         startup_layout.addStretch(1)
         tabs.addTab(startup_tab, "Startup")
 
+        python_tab = QWidget(dialog)
+        python_layout = QVBoxLayout(python_tab)
+        python_layout.setContentsMargins(0, 0, 0, 0)
+        python_layout.setSpacing(8)
+
+        python_form = QFormLayout()
+        python_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        interpreter_row = QWidget(dialog)
+        interpreter_row_layout = QHBoxLayout(interpreter_row)
+        interpreter_row_layout.setContentsMargins(0, 0, 0, 0)
+        interpreter_row_layout.setSpacing(6)
+
+        python_interpreter_input = QLineEdit(dialog)
+        python_interpreter_input.setPlaceholderText(r"C:\Python311\python.exe")
+        python_interpreter_input.setText(initial_python_interpreter)
+
+        browse_python_interpreter_button = QPushButton("Browse...", dialog)
+        clear_python_interpreter_button = QPushButton("Clear", dialog)
+
+        def _browse_python_interpreter() -> None:
+            start_path = python_interpreter_input.text().strip()
+            if not start_path:
+                start_path = self.workspace_root or os.getcwd()
+            selected_path, _ = QFileDialog.getOpenFileName(
+                dialog,
+                "Select Python Interpreter",
+                start_path,
+                "Python Executable (python.exe);;All Files (*.*)",
+            )
+            if selected_path:
+                python_interpreter_input.setText(os.path.abspath(selected_path))
+
+        browse_python_interpreter_button.clicked.connect(_browse_python_interpreter)
+        clear_python_interpreter_button.clicked.connect(lambda: python_interpreter_input.clear())
+
+        interpreter_row_layout.addWidget(python_interpreter_input, 1)
+        interpreter_row_layout.addWidget(browse_python_interpreter_button)
+        interpreter_row_layout.addWidget(clear_python_interpreter_button)
+
+        python_hint_label = QLabel(
+            "Used by the Run button on Python files.",
+            python_tab,
+        )
+        python_hint_label.setWordWrap(True)
+
+        python_form.addRow("Interpreter", interpreter_row)
+        python_layout.addLayout(python_form)
+        python_layout.addWidget(python_hint_label)
+        python_layout.addStretch(1)
+        tabs.addTab(python_tab, "Python")
+
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
             dialog,
@@ -2692,6 +2847,7 @@ class MainWindow(QMainWindow):
         selected_window_use_last_size = window_use_last_size_checkbox.isChecked()
         selected_window_width = max(self._MIN_WINDOW_WIDTH, int(window_width_spinbox.value()))
         selected_window_height = max(self._MIN_WINDOW_HEIGHT, int(window_height_spinbox.value()))
+        selected_python_interpreter = python_interpreter_input.text().strip() or None
 
         self._suspend_ui_settings_persistence = True
         try:
@@ -2714,6 +2870,8 @@ class MainWindow(QMainWindow):
                 output_enabled_checkbox.isChecked(),
                 terminal_enabled_checkbox.isChecked(),
             )
+            self._python_interpreter_path = selected_python_interpreter
+            self._refresh_breadcrumbs()
         finally:
             self._suspend_ui_settings_persistence = False
 
@@ -2722,6 +2880,7 @@ class MainWindow(QMainWindow):
             window_use_last_size=selected_window_use_last_size,
             window_width=selected_window_width,
             window_height=selected_window_height,
+            python_interpreter=selected_python_interpreter,
         ):
             self.statusBar().showMessage("Settings saved.", 2200)
             self.log(
@@ -2732,6 +2891,7 @@ class MainWindow(QMainWindow):
                 f"autosave_strategy={selected_autosave_strategy}, "
                 f"layout={self._bottom_layout_mode}, "
                 f"output_visible={self.output_dock.isVisible()}, terminal_visible={self.terminal_dock.isVisible()}, "
+                f"python_interpreter={selected_python_interpreter}, "
                 f"window_use_last_size={selected_window_use_last_size}, "
                 f"window={selected_window_width}x{selected_window_height}"
             )
@@ -2802,6 +2962,9 @@ class MainWindow(QMainWindow):
                 "window": {
                     "use_last_size": False,
                 },
+            },
+            "python": {
+                "interpreter": "",
             },
         }
 
@@ -2922,6 +3085,27 @@ class MainWindow(QMainWindow):
             self.log("[settings] ui.code_zoom_point_size out of bounds; clamped to supported range.")
         return clamped_zoom
 
+    def _parse_python_interpreter_setting(self, payload: object) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+
+        python_payload = payload.get("python")
+        if python_payload is None:
+            return None
+        if not isinstance(python_payload, dict):
+            self.log("[settings] Invalid python section; using empty interpreter.")
+            return None
+
+        interpreter_value = python_payload.get("interpreter")
+        if interpreter_value is None:
+            return None
+        if not isinstance(interpreter_value, str):
+            self.log("[settings] Invalid python.interpreter; using empty interpreter.")
+            return None
+
+        normalized = interpreter_value.strip()
+        return normalized or None
+
     def _parse_bottom_panel_visibility_settings(self, payload: object) -> tuple[bool, bool]:
         output_enabled = self.output_dock.isVisible() if hasattr(self, "output_dock") else True
         terminal_enabled = self.terminal_dock.isVisible() if hasattr(self, "terminal_dock") else True
@@ -3007,6 +3191,7 @@ class MainWindow(QMainWindow):
         window_use_last_size: bool | None = None,
         window_width: int | None = None,
         window_height: int | None = None,
+        python_interpreter: str | None = None,
     ) -> bool:
         settings_path = self._workspace_settings_path()
         payload: dict[str, object] = self._default_settings_payload()
@@ -3078,6 +3263,19 @@ class MainWindow(QMainWindow):
         )
         ui_payload["window"] = window_payload
         payload["ui"] = ui_payload
+
+        python_payload = payload.get("python")
+        if not isinstance(python_payload, dict):
+            python_payload = {}
+        existing_interpreter_value = python_payload.get("interpreter")
+        if isinstance(python_interpreter, str):
+            resolved_interpreter = python_interpreter.strip()
+        elif isinstance(existing_interpreter_value, str):
+            resolved_interpreter = existing_interpreter_value.strip()
+        else:
+            resolved_interpreter = self._normalized_python_interpreter() or ""
+        python_payload["interpreter"] = resolved_interpreter
+        payload["python"] = python_payload
 
         try:
             with open(settings_path, "w", encoding="utf-8", newline="\n") as handle:
@@ -3183,6 +3381,7 @@ class MainWindow(QMainWindow):
         self._autosave_enabled, self._autosave_interval_seconds = self._parse_autosave_settings(payload)
         self._ui_zoom_percent = self._parse_ui_zoom_setting(payload)
         self._code_zoom_point_size = self._parse_code_zoom_setting(payload)
+        self._python_interpreter_path = self._parse_python_interpreter_setting(payload)
         self._apply_theme(self._parse_theme_setting(payload))
         self._apply_code_zoom_to_open_editors()
         self._update_ui_zoom_actions()

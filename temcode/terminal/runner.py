@@ -68,6 +68,32 @@ class CmdTerminalWidget(QPlainTextEdit):
         self._process.kill()
         return self._process.waitForFinished(timeout_ms)
 
+    def execute_command(self, command: str) -> bool:
+        command_text = command.strip()
+        if not command_text:
+            return False
+
+        if self._process.state() != QProcess.ProcessState.Running:
+            self.start_shell(self._working_directory)
+            if not self._process.waitForStarted(2000):
+                return False
+
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.setTextCursor(cursor)
+
+        if self._current_input_text():
+            cursor.insertText("\n")
+            self._input_anchor = len(self.toPlainText())
+
+        cursor.insertText(command_text + "\n")
+        self._input_anchor = len(self.toPlainText())
+
+        payload = (command_text + "\r\n").encode(self._encoding, errors="replace")
+        self._process.write(payload)
+        self.moveCursor(QTextCursor.MoveOperation.End)
+        return True
+
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 (Qt API)
         if event.matches(QKeySequence.StandardKey.Copy) or event.matches(QKeySequence.StandardKey.SelectAll):
             super().keyPressEvent(event)

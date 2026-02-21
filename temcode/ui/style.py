@@ -525,6 +525,18 @@ QLabel#breadcrumbSeparator {{
     padding: 0 1px;
 }}
 
+QPushButton#pythonRunButton {{
+    background: {colors["button_bg"]};
+    border: 1px solid {colors["button_border"]};
+    padding: 2px 10px;
+    min-height: 20px;
+    border-radius: 4px;
+}}
+
+QPushButton#pythonRunButton:hover {{
+    background: {colors["button_hover_bg"]};
+}}
+
 QLabel#editorPlaceholder {{
     color: {colors["placeholder_fg"]};
     font-size: {pt(16)};
