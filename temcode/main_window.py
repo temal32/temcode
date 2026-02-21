@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import shutil
 import hashlib
 import re
@@ -11,8 +12,9 @@ import webbrowser
 from datetime import datetime
 
 from PySide6.QtCore import QDir, QEvent, QFileSystemWatcher, QModelIndex, QPoint, Qt, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QColor, QCloseEvent, QKeySequence, QTextCharFormat, QTextCursor, QTextDocument
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QKeySequence, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QAbstractItemView,
     QApplication,
     QCheckBox,
@@ -75,7 +77,6 @@ class MainWindow(QMainWindow):
     _AUTOSAVE_DIR_NAME = "autosave"
     _RECENT_PATHS_FILE_NAME = "recent_paths.json"
     _MAX_RECENT_PATHS = 20
-    _BOTTOM_LAYOUT_STACKED = "stacked"
     _BOTTOM_LAYOUT_SIDE_BY_SIDE = "side_by_side"
     _DEFAULT_THEME_ID = DEFAULT_THEME_ID
     _DEFAULT_UI_ZOOM_PERCENT = 100
@@ -94,6 +95,28 @@ class MainWindow(QMainWindow):
     _LSP_DID_CHANGE_DEBOUNCE_MS = 180
     _LSP_MAX_COMPLETION_ITEMS = 40
     _LSP_MAX_DIAGNOSTIC_SELECTIONS = 350
+    _WELCOME_TITLES = (
+        "Welcome to Temcode, {user}",
+        "What do you want to code today?",
+        "Ready to build something useful?",
+        "Start small, ship fast.",
+        "Your next idea starts here.",
+        "Write clean code and make it real.",
+        "Open a file and get moving.",
+        "Time to turn ideas into features.",
+        "Need a fresh script? Let us begin.",
+        "Pick a project and dive in.",
+        "Another session, another milestone.",
+        "Create, test, improve, repeat.",
+        "What are we building today, {user}?",
+        "One commit closer to done.",
+        "Debug less, build more.",
+        "Ship one thing today.",
+        "Let us get this project in shape.",
+        "Focus mode: on.",
+        "Code with intent, {user}.",
+        "New session, new progress.",
+    )
     _IMAGE_FILE_EXTENSIONS = {
         ".png",
         ".jpg",
@@ -124,7 +147,7 @@ class MainWindow(QMainWindow):
         self._settings_file_path: str | None = None
         self._recent_paths_file_path: str | None = None
         self._recent_paths: list[str] = []
-        self._bottom_layout_mode = self._BOTTOM_LAYOUT_STACKED
+        self._bottom_layout_mode = self._BOTTOM_LAYOUT_SIDE_BY_SIDE
         self._suspend_ui_settings_persistence = False
         self._settings_persistence_splitter_ids: set[int] = set()
         self._is_app_closing = False
@@ -176,6 +199,7 @@ class MainWindow(QMainWindow):
         self._update_solution_explorer_surface()
         self._refresh_lsp_status_label()
         self._file_poll_timer.start()
+        self._apply_pointing_cursor_to_buttons(self)
 
     def should_start_maximized(self) -> bool:
         return self._start_maximized
@@ -272,25 +296,6 @@ class MainWindow(QMainWindow):
         self.split_toggle_action = QAction("Split Editor", self)
         self.split_toggle_action.setCheckable(True)
         self.split_toggle_action.toggled.connect(self._set_split_enabled)
-        self.bottom_layout_action_group = QActionGroup(self)
-        self.bottom_layout_action_group.setExclusive(True)
-
-        self.bottom_layout_stacked_action = QAction("Stacked", self)
-        self.bottom_layout_stacked_action.setCheckable(True)
-
-        self.bottom_layout_side_by_side_action = QAction("Side by Side", self)
-        self.bottom_layout_side_by_side_action.setCheckable(True)
-
-        self.bottom_layout_action_group.addAction(self.bottom_layout_stacked_action)
-        self.bottom_layout_action_group.addAction(self.bottom_layout_side_by_side_action)
-        self.bottom_layout_stacked_action.setChecked(True)
-        self.bottom_layout_stacked_action.toggled.connect(
-            lambda checked: checked and self._set_bottom_dock_layout(self._BOTTOM_LAYOUT_STACKED)
-        )
-        self.bottom_layout_side_by_side_action.toggled.connect(
-            lambda checked: checked and self._set_bottom_dock_layout(self._BOTTOM_LAYOUT_SIDE_BY_SIDE)
-        )
-
         self.move_tab_to_other_split_action = QAction("Move Tab To Other Split", self)
         self.move_tab_to_other_split_action.setShortcut(QKeySequence("Ctrl+Shift+M"))
         self.move_tab_to_other_split_action.triggered.connect(self.move_current_tab_to_other_split)
@@ -311,10 +316,6 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.output_toggle_action)
         view_menu.addAction(self.terminal_toggle_action)
         view_menu.addSeparator()
-        bottom_layout_menu = view_menu.addMenu("Bottom Panel Layout")
-        bottom_layout_menu.addAction(self.bottom_layout_stacked_action)
-        bottom_layout_menu.addAction(self.bottom_layout_side_by_side_action)
-        view_menu.addSeparator()
         view_menu.addAction(self.split_toggle_action)
         view_menu.addAction(self.move_tab_to_other_split_action)
         view_menu.addSeparator()
@@ -332,6 +333,11 @@ class MainWindow(QMainWindow):
         about_action = QAction("&About Temcode", self)
         about_action.triggered.connect(lambda: self.statusBar().showMessage(f"Temcode Version {__version__}", 2500))
         help_menu.addAction(about_action)
+
+        menu_bar = self.menuBar()
+        menu_bar.setCursor(Qt.CursorShape.PointingHandCursor)
+        for menu in menu_bar.findChildren(QMenu):
+            menu.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def _build_status_bar(self) -> None:
         self.statusBar().showMessage("Ready")
@@ -454,7 +460,9 @@ class MainWindow(QMainWindow):
         panel_layout.setContentsMargins(28, 24, 28, 24)
         panel_layout.setSpacing(12)
 
-        title_label = QLabel("Welcome to Temcode", panel)
+        user_name = os.environ.get("USERNAME") or os.environ.get("USER") or os.getlogin()
+        welcome_title = random.choice(self._WELCOME_TITLES).format(user=user_name)
+        title_label = QLabel(welcome_title, panel)
         title_label.setObjectName("welcomeTitle")
 
         subtitle_label = QLabel(
@@ -500,6 +508,8 @@ class MainWindow(QMainWindow):
 
         self.welcome_recent_list = QListWidget(panel)
         self.welcome_recent_list.setObjectName("welcomeRecentList")
+        self.welcome_recent_list.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.welcome_recent_list.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
         self.welcome_recent_list.itemActivated.connect(self._on_recent_item_activated)
         self.welcome_recent_list.itemDoubleClicked.connect(self._on_recent_item_activated)
 
@@ -908,7 +918,7 @@ class MainWindow(QMainWindow):
 
         self.terminal_dock.setWidget(terminal_container)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.terminal_dock)
-        self._set_bottom_dock_layout(self._bottom_layout_mode, persist=False)
+        self._set_bottom_dock_layout(persist=False)
 
         self.terminal_toggle_action.setCheckable(True)
         self.terminal_toggle_action.setChecked(True)
@@ -917,27 +927,18 @@ class MainWindow(QMainWindow):
         self.terminal_dock.installEventFilter(self)
         terminal_container.installEventFilter(self)
 
-    def _set_bottom_dock_layout(self, layout_mode: str, persist: bool = True) -> None:
-        if layout_mode not in {self._BOTTOM_LAYOUT_STACKED, self._BOTTOM_LAYOUT_SIDE_BY_SIDE}:
-            return
-
-        self._bottom_layout_mode = layout_mode
+    def _set_bottom_dock_layout(self, persist: bool = True) -> None:
+        self._bottom_layout_mode = self._BOTTOM_LAYOUT_SIDE_BY_SIDE
         if not hasattr(self, "output_dock") or not hasattr(self, "terminal_dock"):
             return
 
-        if layout_mode == self._BOTTOM_LAYOUT_SIDE_BY_SIDE:
-            orientation = Qt.Orientation.Horizontal
-            layout_label = "side by side"
-        else:
-            orientation = Qt.Orientation.Vertical
-            layout_label = "stacked"
-
+        orientation = Qt.Orientation.Horizontal
         self.splitDockWidget(self.output_dock, self.terminal_dock, orientation)
         self.resizeDocks([self.output_dock, self.terminal_dock], [1, 1], orientation)
         self._connect_splitter_move_persistence_hooks()
         if persist:
             self._persist_ui_settings()
-        self.log(f"[layout] Bottom panels set to {layout_label}.")
+        self.log("[layout] Bottom panels set to side by side.")
 
     def _on_output_dock_visibility_changed(self, is_visible: bool) -> None:
         self.output_toggle_action.blockSignals(True)
@@ -977,6 +978,40 @@ class MainWindow(QMainWindow):
             if any(watched is target for target in watch_targets if target is not None) and event.type() in watch_event_types:
                 self._schedule_ui_settings_persistence()
         return super().eventFilter(watched, event)
+
+    def _apply_pointing_cursor_to_buttons(self, root: QWidget | None) -> None:
+        if root is None:
+            return
+
+        pointing_cursor = Qt.CursorShape.PointingHandCursor
+
+        if isinstance(root, QAbstractButton):
+            root.setCursor(pointing_cursor)
+        if isinstance(root, QAbstractItemView):
+            root.setCursor(pointing_cursor)
+            root.viewport().setCursor(pointing_cursor)
+        if isinstance(root, QComboBox):
+            root.setCursor(pointing_cursor)
+            popup_view = root.view()
+            if popup_view is not None:
+                popup_view.setCursor(pointing_cursor)
+                popup_view.viewport().setCursor(pointing_cursor)
+        if isinstance(root, QTabBar):
+            root.setCursor(pointing_cursor)
+
+        for button in root.findChildren(QAbstractButton):
+            button.setCursor(pointing_cursor)
+        for item_view in root.findChildren(QAbstractItemView):
+            item_view.setCursor(pointing_cursor)
+            item_view.viewport().setCursor(pointing_cursor)
+        for combo_box in root.findChildren(QComboBox):
+            combo_box.setCursor(pointing_cursor)
+            popup_view = combo_box.view()
+            if popup_view is not None:
+                popup_view.setCursor(pointing_cursor)
+                popup_view.viewport().setCursor(pointing_cursor)
+        for tab_bar in root.findChildren(QTabBar):
+            tab_bar.setCursor(pointing_cursor)
 
     def _schedule_ui_settings_persistence(self) -> None:
         if self._suspend_ui_settings_persistence or self._is_app_closing:
@@ -1391,6 +1426,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Open Image", f"Could not decode image:\n{absolute_path}")
             return
 
+        self._apply_pointing_cursor_to_buttons(viewer)
         viewer.setProperty("file_path", absolute_path)
         viewer.setProperty("display_name", os.path.basename(absolute_path))
 
@@ -2615,12 +2651,6 @@ class MainWindow(QMainWindow):
         if not isinstance(ui_payload, dict):
             ui_payload = {}
 
-        layout_value = ui_payload.get("bottom_panel_layout")
-        if layout_value in {self._BOTTOM_LAYOUT_STACKED, self._BOTTOM_LAYOUT_SIDE_BY_SIDE}:
-            initial_bottom_layout = layout_value
-        else:
-            initial_bottom_layout = self._bottom_layout_mode
-
         output_enabled_value = ui_payload.get("output_enabled")
         initial_output_enabled = output_enabled_value if isinstance(output_enabled_value, bool) else self.output_dock.isVisible()
 
@@ -2745,20 +2775,12 @@ class MainWindow(QMainWindow):
         panels_form = QFormLayout()
         panels_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
-        bottom_layout_combobox = QComboBox(dialog)
-        bottom_layout_combobox.addItem("Stacked", self._BOTTOM_LAYOUT_STACKED)
-        bottom_layout_combobox.addItem("Side by side", self._BOTTOM_LAYOUT_SIDE_BY_SIDE)
-        current_bottom_layout_index = bottom_layout_combobox.findData(initial_bottom_layout)
-        if current_bottom_layout_index >= 0:
-            bottom_layout_combobox.setCurrentIndex(current_bottom_layout_index)
-
         output_enabled_checkbox = QCheckBox("Show Output panel", dialog)
         output_enabled_checkbox.setChecked(initial_output_enabled)
 
         terminal_enabled_checkbox = QCheckBox("Show Terminal panel", dialog)
         terminal_enabled_checkbox.setChecked(initial_terminal_enabled)
 
-        panels_form.addRow("Bottom layout", bottom_layout_combobox)
         panels_form.addRow("Output", output_enabled_checkbox)
         panels_form.addRow("Terminal", terminal_enabled_checkbox)
 
@@ -2871,6 +2893,7 @@ class MainWindow(QMainWindow):
         button_box.accepted.connect(dialog.accept)
         button_box.rejected.connect(dialog.reject)
         layout.addWidget(button_box)
+        self._apply_pointing_cursor_to_buttons(dialog)
 
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
             return
@@ -2886,12 +2909,6 @@ class MainWindow(QMainWindow):
             self._clamp_code_zoom_point_size(code_zoom_spinbox.value())
             if code_zoom_override_checkbox.isChecked()
             else None
-        )
-        selected_bottom_layout_data = bottom_layout_combobox.currentData()
-        selected_bottom_layout = (
-            selected_bottom_layout_data
-            if selected_bottom_layout_data in {self._BOTTOM_LAYOUT_STACKED, self._BOTTOM_LAYOUT_SIDE_BY_SIDE}
-            else self._BOTTOM_LAYOUT_STACKED
         )
         selected_autosave_strategy = autosave_strategy_combobox.currentText().strip() or "backup"
         selected_window_use_last_size = window_use_last_size_checkbox.isChecked()
@@ -2915,7 +2932,7 @@ class MainWindow(QMainWindow):
             self._autosave_last_summary = ""
             self._configure_autosave_timer()
 
-            self._apply_bottom_layout_setting(selected_bottom_layout)
+            self._apply_bottom_layout_setting(self._BOTTOM_LAYOUT_SIDE_BY_SIDE)
             self._apply_bottom_panel_visibility_settings(
                 output_enabled_checkbox.isChecked(),
                 terminal_enabled_checkbox.isChecked(),
@@ -3006,7 +3023,7 @@ class MainWindow(QMainWindow):
                 "theme": self._DEFAULT_THEME_ID,
                 "zoom_percent": self._DEFAULT_UI_ZOOM_PERCENT,
                 "code_zoom_point_size": None,
-                "bottom_panel_layout": self._BOTTOM_LAYOUT_STACKED,
+                "bottom_panel_layout": self._BOTTOM_LAYOUT_SIDE_BY_SIDE,
                 "output_enabled": True,
                 "terminal_enabled": True,
                 "terminal_height": None,
@@ -3061,19 +3078,22 @@ class MainWindow(QMainWindow):
 
     def _parse_bottom_layout_setting(self, payload: object) -> str:
         if not isinstance(payload, dict):
-            return self._bottom_layout_mode
+            return self._BOTTOM_LAYOUT_SIDE_BY_SIDE
 
         ui_payload = payload.get("ui")
         if not isinstance(ui_payload, dict):
-            return self._bottom_layout_mode
+            return self._BOTTOM_LAYOUT_SIDE_BY_SIDE
 
         layout_value = ui_payload.get("bottom_panel_layout")
-        if layout_value in {self._BOTTOM_LAYOUT_STACKED, self._BOTTOM_LAYOUT_SIDE_BY_SIDE}:
-            return layout_value
+        if layout_value == self._BOTTOM_LAYOUT_SIDE_BY_SIDE:
+            return self._BOTTOM_LAYOUT_SIDE_BY_SIDE
+        if layout_value == "stacked":
+            self.log("[settings] ui.bottom_panel_layout=stacked is deprecated; using side_by_side.")
+            return self._BOTTOM_LAYOUT_SIDE_BY_SIDE
 
         if layout_value is not None:
-            self.log("[settings] Invalid ui.bottom_panel_layout; keeping current layout.")
-        return self._bottom_layout_mode
+            self.log("[settings] Invalid ui.bottom_panel_layout; using side_by_side.")
+        return self._BOTTOM_LAYOUT_SIDE_BY_SIDE
 
     def _parse_theme_setting(self, payload: object) -> str:
         if not isinstance(payload, dict):
@@ -3194,11 +3214,11 @@ class MainWindow(QMainWindow):
         return max(self._MIN_TERMINAL_DOCK_HEIGHT, parsed_height)
 
     def _current_terminal_height(self) -> int | None:
-        if not hasattr(self, "terminal_dock"):
-            return None
-        if not self.terminal_dock.isVisible():
-            return None
-        return self._normalize_terminal_height(self.terminal_dock.height())
+        if hasattr(self, "terminal_dock") and self.terminal_dock.isVisible():
+            return self._normalize_terminal_height(self.terminal_dock.height())
+        if hasattr(self, "output_dock") and self.output_dock.isVisible():
+            return self._normalize_terminal_height(self.output_dock.height())
+        return None
 
     def _parse_terminal_height_setting(self, payload: object) -> int | None:
         if not isinstance(payload, dict):
@@ -3220,29 +3240,22 @@ class MainWindow(QMainWindow):
     def _apply_terminal_height_setting(self, terminal_height: int | None) -> None:
         if terminal_height is None:
             return
-        if not self.output_dock.isVisible() or not self.terminal_dock.isVisible():
-            return
 
         normalized_terminal_height = self._normalize_terminal_height(terminal_height)
         if normalized_terminal_height is None:
             return
 
-        if self._bottom_layout_mode == self._BOTTOM_LAYOUT_STACKED:
-            total_bottom_height = int(self.output_dock.height()) + int(self.terminal_dock.height())
-            if total_bottom_height <= 1:
-                return
-            normalized_terminal_height = max(1, min(normalized_terminal_height, total_bottom_height - 1))
-            output_height = max(1, total_bottom_height - normalized_terminal_height)
-            self.resizeDocks(
-                [self.output_dock, self.terminal_dock],
-                [output_height, normalized_terminal_height],
-                Qt.Orientation.Vertical,
-            )
+        visible_bottom_docks: list[QDockWidget] = []
+        if self.output_dock.isVisible():
+            visible_bottom_docks.append(self.output_dock)
+        if self.terminal_dock.isVisible():
+            visible_bottom_docks.append(self.terminal_dock)
+        if not visible_bottom_docks:
             return
 
         self.resizeDocks(
-            [self.output_dock, self.terminal_dock],
-            [normalized_terminal_height, normalized_terminal_height],
+            visible_bottom_docks,
+            [normalized_terminal_height] * len(visible_bottom_docks),
             Qt.Orientation.Vertical,
         )
 
@@ -3276,14 +3289,9 @@ class MainWindow(QMainWindow):
         return width, height
 
     def _apply_bottom_layout_setting(self, layout_mode: str) -> None:
-        use_side_by_side = layout_mode == self._BOTTOM_LAYOUT_SIDE_BY_SIDE
-        self.bottom_layout_stacked_action.blockSignals(True)
-        self.bottom_layout_side_by_side_action.blockSignals(True)
-        self.bottom_layout_stacked_action.setChecked(not use_side_by_side)
-        self.bottom_layout_side_by_side_action.setChecked(use_side_by_side)
-        self.bottom_layout_stacked_action.blockSignals(False)
-        self.bottom_layout_side_by_side_action.blockSignals(False)
-        self._set_bottom_dock_layout(layout_mode, persist=False)
+        if layout_mode != self._BOTTOM_LAYOUT_SIDE_BY_SIDE:
+            self.log("[layout] Unsupported bottom layout; forcing side by side.")
+        self._set_bottom_dock_layout(persist=False)
 
     def _apply_bottom_panel_visibility_settings(self, output_enabled: bool, terminal_enabled: bool) -> None:
         self._suspend_ui_settings_persistence = True

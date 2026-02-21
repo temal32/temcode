@@ -52,6 +52,14 @@ class ImageViewer(QWidget):
         self._fit_button.setToolTip("Fit image to available area")
         self._fit_button.toggled.connect(self.set_fit_to_window)
 
+        for button in (
+            self._zoom_out_button,
+            self._zoom_in_button,
+            self._actual_size_button,
+            self._fit_button,
+        ):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+
         self._zoom_label = QLabel("Fit", self._toolbar)
         self._zoom_label.setObjectName("imageViewerZoomLabel")
 
