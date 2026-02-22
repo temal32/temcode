@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
 )
 
 from temcode import __version__
+from temcode.discord_rpc import DiscordRpcClient
 from temcode.editor import CodeEditor, ImageViewer, LanguageId
 from temcode.lsp import LspClient, uri_to_path
 from temcode.terminal import CmdTerminalWidget
@@ -92,6 +93,13 @@ class MainWindow(QMainWindow):
     _MIN_WINDOW_HEIGHT = 420
     _MIN_TERMINAL_DOCK_HEIGHT = 80
     _UI_SETTINGS_PERSIST_DEBOUNCE_MS = 250
+    _DEFAULT_DISCORD_RPC_ENABLED = False
+    _DEFAULT_DISCORD_RPC_SHARE_NAMES = False
+    _DEFAULT_DISCORD_RPC_APPLICATION_ID = "1474912338531324106"
+    _DISCORD_RPC_UPDATE_INTERVAL_MS = 15000
+    _DISCORD_RPC_DEBOUNCE_MS = 1000
+    _DISCORD_RPC_LOGO_FILE_PATH = os.path.join(os.path.dirname(__file__), "assets", "temcode_logo.png")
+    _DISCORD_RPC_LOGO_ASSET_KEY = os.path.splitext(os.path.basename(_DISCORD_RPC_LOGO_FILE_PATH))[0]
     _GITHUB_REPO_URL = "https://github.com/temal32/temcode"
     _LSP_DID_CHANGE_DEBOUNCE_MS = 180
     _LSP_MAX_COMPLETION_ITEMS = 40
@@ -166,6 +174,10 @@ class MainWindow(QMainWindow):
         self._ui_zoom_percent = self._DEFAULT_UI_ZOOM_PERCENT
         self._code_zoom_point_size: float | None = None
         self._python_interpreter_path: str | None = None
+        self._discord_rpc_enabled = self._DEFAULT_DISCORD_RPC_ENABLED
+        self._discord_rpc_share_names = self._DEFAULT_DISCORD_RPC_SHARE_NAMES
+        self._discord_rpc_application_id = self._DEFAULT_DISCORD_RPC_APPLICATION_ID
+        self._discord_rpc_session_start_unix = int(time.time())
         self._settings_file_path: str | None = None
         self._recent_paths_file_path: str | None = None
         self._recent_paths: list[str] = []
@@ -182,6 +194,15 @@ class MainWindow(QMainWindow):
         self._ui_settings_persist_timer.setSingleShot(True)
         self._ui_settings_persist_timer.setInterval(self._UI_SETTINGS_PERSIST_DEBOUNCE_MS)
         self._ui_settings_persist_timer.timeout.connect(self._persist_ui_settings)
+        self._discord_rpc_client = DiscordRpcClient(self._discord_rpc_application_id, logger=self.log)
+        self._discord_rpc_timer = QTimer(self)
+        self._discord_rpc_timer.setSingleShot(False)
+        self._discord_rpc_timer.setInterval(self._DISCORD_RPC_UPDATE_INTERVAL_MS)
+        self._discord_rpc_timer.timeout.connect(self._refresh_discord_presence)
+        self._discord_rpc_debounce_timer = QTimer(self)
+        self._discord_rpc_debounce_timer.setSingleShot(True)
+        self._discord_rpc_debounce_timer.setInterval(self._DISCORD_RPC_DEBOUNCE_MS)
+        self._discord_rpc_debounce_timer.timeout.connect(self._refresh_discord_presence)
         self._file_watcher = QFileSystemWatcher(self)
         self._file_watcher.fileChanged.connect(self._on_watched_file_changed)
         self._file_watcher.directoryChanged.connect(self._on_watched_directory_changed)
@@ -566,6 +587,7 @@ class MainWindow(QMainWindow):
         if not has_editors and self.find_panel.isVisible():
             self.close_find_panel()
             self._refresh_breadcrumbs(None)
+        self._schedule_discord_presence_refresh()
 
     def _refresh_welcome_recent_list(self) -> None:
         if not hasattr(self, "welcome_recent_list"):
@@ -729,7 +751,7 @@ class MainWindow(QMainWindow):
             run_button.setToolTip(f"Run {os.path.basename(python_file_path)}")
             run_button.clicked.connect(self._run_current_python_file)
         else:
-            run_button.setText("Set Python Interpreter in Settings First")
+            run_button.setText("Set Python Interpreter in Settings")
             run_button.setToolTip("Set python.interpreter in Settings before running files.")
             run_button.clicked.connect(self._open_settings_for_python_interpreter)
 
@@ -4557,6 +4579,11 @@ class MainWindow(QMainWindow):
         initial_python_interpreter = self._parse_python_interpreter_setting(payload) or (
             self._python_interpreter_path or ""
         )
+        (
+            initial_discord_rpc_enabled,
+            initial_discord_rpc_share_names,
+            initial_discord_rpc_application_id,
+        ) = self._parse_discord_rpc_settings(payload)
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Settings")
@@ -4655,9 +4682,46 @@ class MainWindow(QMainWindow):
         panels_separator.setFrameShape(QFrame.Shape.HLine)
         panels_separator.setFrameShadow(QFrame.Shadow.Sunken)
 
+        discord_separator = QFrame(behavior_tab)
+        discord_separator.setFrameShape(QFrame.Shape.HLine)
+        discord_separator.setFrameShadow(QFrame.Shadow.Sunken)
+
+        discord_form = QFormLayout()
+        discord_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        discord_enabled_checkbox = QCheckBox("Enable Discord Rich Presence", dialog)
+        discord_enabled_checkbox.setChecked(initial_discord_rpc_enabled)
+
+        discord_share_names_checkbox = QCheckBox("Share file and folder names", dialog)
+        discord_share_names_checkbox.setChecked(initial_discord_rpc_share_names)
+        discord_share_names_checkbox.setEnabled(initial_discord_rpc_enabled)
+
+        discord_application_id_input = QLineEdit(dialog)
+        discord_application_id_input.setPlaceholderText("123456789012345678")
+        discord_application_id_input.setText(initial_discord_rpc_application_id)
+
+        discord_enabled_checkbox.toggled.connect(discord_share_names_checkbox.setEnabled)
+
+        discord_form.addRow("Share names", discord_share_names_checkbox)
+        discord_form.addRow("Application ID", discord_application_id_input)
+
+        discord_legal_label = QLabel(
+            (
+                "Temcode is an independent project and is not affiliated with, endorsed by, "
+                "or sponsored by Discord Inc. Discord is a trademark of Discord Inc. "
+                "By enabling this feature, selected activity data is shared with Discord."
+            ),
+            behavior_tab,
+        )
+        discord_legal_label.setWordWrap(True)
+
         behavior_layout.addLayout(autosave_form)
         behavior_layout.addWidget(panels_separator)
         behavior_layout.addLayout(panels_form)
+        behavior_layout.addWidget(discord_separator)
+        behavior_layout.addWidget(discord_enabled_checkbox)
+        behavior_layout.addWidget(discord_legal_label)
+        behavior_layout.addLayout(discord_form)
         behavior_layout.addStretch(1)
         tabs.addTab(behavior_tab, "Behavior")
 
@@ -4782,6 +4846,9 @@ class MainWindow(QMainWindow):
         selected_window_width = max(self._MIN_WINDOW_WIDTH, int(window_width_spinbox.value()))
         selected_window_height = max(self._MIN_WINDOW_HEIGHT, int(window_height_spinbox.value()))
         selected_python_interpreter = python_interpreter_input.text().strip() or None
+        selected_discord_rpc_enabled = discord_enabled_checkbox.isChecked()
+        selected_discord_rpc_share_names = discord_share_names_checkbox.isChecked()
+        selected_discord_rpc_application_id = discord_application_id_input.text().strip()
 
         self._suspend_ui_settings_persistence = True
         try:
@@ -4805,6 +4872,10 @@ class MainWindow(QMainWindow):
                 terminal_enabled_checkbox.isChecked(),
             )
             self._python_interpreter_path = selected_python_interpreter
+            self._discord_rpc_enabled = selected_discord_rpc_enabled
+            self._discord_rpc_share_names = selected_discord_rpc_share_names
+            self._discord_rpc_application_id = selected_discord_rpc_application_id
+            self._configure_discord_rpc(reset_connection=True)
             self._refresh_breadcrumbs()
         finally:
             self._suspend_ui_settings_persistence = False
@@ -4815,6 +4886,9 @@ class MainWindow(QMainWindow):
             window_width=selected_window_width,
             window_height=selected_window_height,
             python_interpreter=selected_python_interpreter,
+            discord_rpc_enabled=selected_discord_rpc_enabled,
+            discord_rpc_share_names=selected_discord_rpc_share_names,
+            discord_rpc_application_id=selected_discord_rpc_application_id,
         ):
             self.statusBar().showMessage("Settings saved.", 2200)
             self.log(
@@ -4826,6 +4900,9 @@ class MainWindow(QMainWindow):
                 f"layout={self._bottom_layout_mode}, "
                 f"output_visible={self.output_dock.isVisible()}, terminal_visible={self.terminal_dock.isVisible()}, "
                 f"python_interpreter={selected_python_interpreter}, "
+                f"discord_rpc_enabled={selected_discord_rpc_enabled}, "
+                f"discord_share_names={selected_discord_rpc_share_names}, "
+                f"discord_application_id_set={bool(selected_discord_rpc_application_id)}, "
                 f"window_use_last_size={selected_window_use_last_size}, "
                 f"window={selected_window_width}x{selected_window_height}"
             )
@@ -4901,6 +4978,11 @@ class MainWindow(QMainWindow):
             },
             "python": {
                 "interpreter": "",
+            },
+            "discord_rpc": {
+                "enabled": self._DEFAULT_DISCORD_RPC_ENABLED,
+                "share_file_and_folder_names": self._DEFAULT_DISCORD_RPC_SHARE_NAMES,
+                "application_id": self._DEFAULT_DISCORD_RPC_APPLICATION_ID,
             },
         }
 
@@ -5045,6 +5127,41 @@ class MainWindow(QMainWindow):
         normalized = interpreter_value.strip()
         return normalized or None
 
+    def _parse_discord_rpc_settings(self, payload: object) -> tuple[bool, bool, str]:
+        enabled = self._DEFAULT_DISCORD_RPC_ENABLED
+        share_names = self._DEFAULT_DISCORD_RPC_SHARE_NAMES
+        application_id = self._DEFAULT_DISCORD_RPC_APPLICATION_ID
+
+        if not isinstance(payload, dict):
+            return enabled, share_names, application_id
+
+        discord_payload = payload.get("discord_rpc")
+        if discord_payload is None:
+            return enabled, share_names, application_id
+        if not isinstance(discord_payload, dict):
+            self.log("[settings] Invalid discord_rpc section; using defaults.")
+            return enabled, share_names, application_id
+
+        enabled_value = discord_payload.get("enabled")
+        if isinstance(enabled_value, bool):
+            enabled = enabled_value
+        elif enabled_value is not None:
+            self.log("[settings] Invalid discord_rpc.enabled; using default value.")
+
+        share_names_value = discord_payload.get("share_file_and_folder_names")
+        if isinstance(share_names_value, bool):
+            share_names = share_names_value
+        elif share_names_value is not None:
+            self.log("[settings] Invalid discord_rpc.share_file_and_folder_names; using default value.")
+
+        application_id_value = discord_payload.get("application_id")
+        if isinstance(application_id_value, str):
+            application_id = application_id_value.strip()
+        elif application_id_value is not None:
+            self.log("[settings] Invalid discord_rpc.application_id; expected a string.")
+
+        return enabled, share_names, application_id
+
     def _parse_bottom_panel_visibility_settings(self, payload: object) -> tuple[bool, bool]:
         output_enabled = self.output_dock.isVisible() if hasattr(self, "output_dock") else True
         terminal_enabled = self.terminal_dock.isVisible() if hasattr(self, "terminal_dock") else True
@@ -5183,6 +5300,9 @@ class MainWindow(QMainWindow):
         window_width: int | None = None,
         window_height: int | None = None,
         python_interpreter: str | None = None,
+        discord_rpc_enabled: bool | None = None,
+        discord_rpc_share_names: bool | None = None,
+        discord_rpc_application_id: str | None = None,
     ) -> bool:
         settings_path = self._workspace_settings_path()
         payload: dict[str, object] = self._default_settings_payload()
@@ -5270,6 +5390,38 @@ class MainWindow(QMainWindow):
             resolved_interpreter = self._normalized_python_interpreter() or ""
         python_payload["interpreter"] = resolved_interpreter
         payload["python"] = python_payload
+
+        discord_payload = payload.get("discord_rpc")
+        if not isinstance(discord_payload, dict):
+            discord_payload = {}
+        existing_discord_enabled = discord_payload.get("enabled")
+        if isinstance(discord_rpc_enabled, bool):
+            resolved_discord_enabled = discord_rpc_enabled
+        elif isinstance(existing_discord_enabled, bool):
+            resolved_discord_enabled = existing_discord_enabled
+        else:
+            resolved_discord_enabled = self._discord_rpc_enabled
+
+        existing_discord_share_names = discord_payload.get("share_file_and_folder_names")
+        if isinstance(discord_rpc_share_names, bool):
+            resolved_discord_share_names = discord_rpc_share_names
+        elif isinstance(existing_discord_share_names, bool):
+            resolved_discord_share_names = existing_discord_share_names
+        else:
+            resolved_discord_share_names = self._discord_rpc_share_names
+
+        existing_discord_application_id = discord_payload.get("application_id")
+        if isinstance(discord_rpc_application_id, str):
+            resolved_discord_application_id = discord_rpc_application_id.strip()
+        elif isinstance(existing_discord_application_id, str):
+            resolved_discord_application_id = existing_discord_application_id.strip()
+        else:
+            resolved_discord_application_id = self._discord_rpc_application_id.strip()
+
+        discord_payload["enabled"] = resolved_discord_enabled
+        discord_payload["share_file_and_folder_names"] = resolved_discord_share_names
+        discord_payload["application_id"] = resolved_discord_application_id
+        payload["discord_rpc"] = discord_payload
 
         try:
             with open(settings_path, "w", encoding="utf-8", newline="\n") as handle:
@@ -5379,6 +5531,11 @@ class MainWindow(QMainWindow):
         self._ui_zoom_percent = self._parse_ui_zoom_setting(payload)
         self._code_zoom_point_size = self._parse_code_zoom_setting(payload)
         self._python_interpreter_path = self._parse_python_interpreter_setting(payload)
+        (
+            self._discord_rpc_enabled,
+            self._discord_rpc_share_names,
+            self._discord_rpc_application_id,
+        ) = self._parse_discord_rpc_settings(payload)
         saved_terminal_height = self._parse_terminal_height_setting(payload)
         self._apply_theme(self._parse_theme_setting(payload))
         self._apply_code_zoom_to_open_editors()
@@ -5397,6 +5554,116 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda height=saved_terminal_height: self._apply_terminal_height_setting(height))
         self._autosave_last_summary = ""
         self._configure_autosave_timer()
+        self._configure_discord_rpc(reset_connection=True)
+
+    @staticmethod
+    def _is_valid_discord_rpc_application_id(value: str) -> bool:
+        return bool(re.fullmatch(r"\d{17,20}", value))
+
+    def _configure_discord_rpc(self, *, reset_connection: bool = False) -> None:
+        self._discord_rpc_client.set_client_id(self._discord_rpc_application_id)
+        if reset_connection:
+            self._discord_rpc_client.close(clear_activity=True)
+
+        if not self._discord_rpc_enabled:
+            self._discord_rpc_timer.stop()
+            self._discord_rpc_debounce_timer.stop()
+            self._discord_rpc_client.close(clear_activity=True)
+            return
+
+        if not self._is_valid_discord_rpc_application_id(self._discord_rpc_application_id):
+            self._discord_rpc_timer.stop()
+            self._discord_rpc_debounce_timer.stop()
+            self._discord_rpc_client.close(clear_activity=True)
+            self.log(
+                "[discord] Discord RPC is enabled, but discord_rpc.application_id is missing or invalid."
+            )
+            self.statusBar().showMessage("Discord RPC enabled, but application ID is invalid.", 3000)
+            return
+
+        if not os.path.isfile(self._DISCORD_RPC_LOGO_FILE_PATH):
+            self.log(
+                f"[discord] Logo file not found at {self._DISCORD_RPC_LOGO_FILE_PATH}; "
+                f"using asset key '{self._DISCORD_RPC_LOGO_ASSET_KEY}'."
+            )
+
+        if not self._discord_rpc_timer.isActive():
+            self._discord_rpc_timer.start()
+        self._refresh_discord_presence()
+
+    def _schedule_discord_presence_refresh(self, immediate: bool = False) -> None:
+        if not self._discord_rpc_enabled:
+            return
+        if immediate:
+            self._refresh_discord_presence()
+            return
+        self._discord_rpc_debounce_timer.start()
+
+    @staticmethod
+    def _truncate_discord_text(value: str, limit: int = 120) -> str:
+        normalized = re.sub(r"\s+", " ", value).strip()
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[: max(0, limit - 3)].rstrip() + "..."
+
+    def _current_discord_project_name(self) -> str | None:
+        if self.workspace_root and os.path.isdir(self.workspace_root):
+            workspace_name = os.path.basename(self.workspace_root.rstrip("\\/"))
+            if workspace_name:
+                return workspace_name
+
+        widget = self._current_tab_widget()
+        if widget is None:
+            return None
+        widget_path = self._widget_file_path(widget)
+        if not widget_path:
+            return None
+        parent_dir = os.path.dirname(os.path.abspath(widget_path))
+        parent_name = os.path.basename(parent_dir.rstrip("\\/"))
+        return parent_name or None
+
+    def _build_discord_activity_payload(self) -> dict[str, object]:
+        project_name = self._current_discord_project_name()
+        active_widget = self._current_tab_widget()
+        active_display_name = self._widget_display_name(active_widget) if active_widget is not None else ""
+
+        if self._discord_rpc_share_names:
+            if active_widget is not None and active_display_name:
+                if isinstance(active_widget, ImageViewer):
+                    details = f"Viewing {active_display_name}"
+                else:
+                    details = f"Editing {active_display_name}"
+            elif project_name:
+                details = "Browsing project files"
+            else:
+                details = "Coding with Temcode"
+            state = f"Project: {project_name}" if project_name else "No workspace selected"
+        else:
+            details = "Coding with Temcode"
+            state = "Temcode session active"
+
+        activity_payload: dict[str, object] = {
+            "details": self._truncate_discord_text(details),
+            "state": self._truncate_discord_text(state),
+            "timestamps": {
+                "start": self._discord_rpc_session_start_unix,
+            },
+            "assets": {
+                # Discord RPC uses the uploaded asset key; this maps to temcode/assets/temcode_logo.png -> "temcode_logo".
+                "large_image": self._DISCORD_RPC_LOGO_ASSET_KEY,
+                "large_text": "Temcode",
+            },
+        }
+        return activity_payload
+
+    def _refresh_discord_presence(self) -> None:
+        if not self._discord_rpc_enabled:
+            return
+        if not self._is_valid_discord_rpc_application_id(self._discord_rpc_application_id):
+            return
+        self._discord_rpc_client.set_client_id(self._discord_rpc_application_id)
+        activity_payload = self._build_discord_activity_payload()
+        self._discord_rpc_client.set_activity(activity_payload)
 
     def _workspace_recent_paths_path(self) -> str:
         return os.path.join(self._workspace_settings_dir(), self._RECENT_PATHS_FILE_NAME)
@@ -6023,6 +6290,7 @@ class MainWindow(QMainWindow):
 
         file_path = self._widget_file_path(widget)
         tabs.setTabToolTip(tab_index, file_path or display_name)
+        self._schedule_discord_presence_refresh()
 
     def _update_open_tabs_after_rename(self, old_path: str, new_path: str) -> None:
         old_key = self._normalize_path(old_path)
@@ -6181,6 +6449,8 @@ class MainWindow(QMainWindow):
         self._is_app_closing = True
         self._autosave_timer.stop()
         self._ui_settings_persist_timer.stop()
+        self._discord_rpc_timer.stop()
+        self._discord_rpc_debounce_timer.stop()
         self._file_poll_timer.stop()
         if self.terminal_console is not None and not self.terminal_console.shutdown(timeout_ms=2500):
             QMessageBox.warning(
@@ -6197,6 +6467,7 @@ class MainWindow(QMainWindow):
             return
 
         self._persist_ui_settings()
+        self._discord_rpc_client.close(clear_activity=True)
         self._lsp_client.stop()
         event.accept()
 
